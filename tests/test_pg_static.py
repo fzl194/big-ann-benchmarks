@@ -10,6 +10,7 @@ from scipy.sparse import csr_matrix
 
 from benchmark.algorithms.pg_exact import PGFilterExact, PGSparseExact
 from benchmark.algorithms.pg_dense import PGDenseANN
+from benchmark.algorithms.pg_filtered import PGFilteredANN
 from benchmark.dataset_io import write_sparse_matrix
 from benchmark.datasets import DATASETS
 from benchmark.local_dataset import LocalDenseDataset, LocalCSRDataset
@@ -129,6 +130,22 @@ class StaticIntegrationTests(unittest.TestCase):
         finally:
             adapter.done()
 
+    def test_native_l1_is_not_l2(self):
+        base=np.full((96,8),100,dtype=np.float32)
+        base[:,0]+=np.arange(96)
+        base[0]=[3,0,0,0,0,0,0,0]
+        base[1]=[2,2,0,0,0,0,0,0]
+        adapter=PGDenseANN("manhattan",{"R":16,"L":64,"build_threads":2,"min_run_rows":0})
+        try:
+            adapter.fit(base)
+            adapter.set_query_arguments(200,1)
+            found=adapter.query(np.zeros(8,dtype=np.float32),10)
+            self.assertEqual(found[0],0)  # L2 would prefer row 1.
+            expected=np.argsort(np.sum(np.abs(base.astype(np.float64)),axis=1),kind="stable")[:10]
+            np.testing.assert_array_equal(found,expected)
+        finally:
+            adapter.done()
+
     def test_label_and_empty_and_missing_filters(self):
         base = np.repeat(np.arange(8, dtype="float32")[:, None], 192, axis=1)
         queries = np.zeros((4, 192), dtype="float32")
@@ -152,6 +169,53 @@ class StaticIntegrationTests(unittest.TestCase):
             adapter.filtered_query(queries, ds.get_queries_metadata(), 3)
             np.testing.assert_array_equal(adapter.get_results(),
                                           [[0,1,3], [0,3,-1], [-1,-1,-1], [0,1,2]])
+        finally:
+            adapter.done()
+
+    def test_adaptive_filtered_ann_expansion_and_explicit_fallback(self):
+        base=np.zeros((96,32),dtype=np.float32)
+        base[:,0]=np.arange(96)
+        queries=base[[0,7,0,0]]
+        write_bin(self.root/"base.bin",base)
+        write_bin(self.root/"queries.bin",queries)
+        labels=[[0]+([1] if i>=80 else [])+([2] if i%2==0 else []) for i in range(96)]
+        query_labels=[[1,2],[],[99],[1]]
+        for filename,rows in [("base.meta",labels),("query.meta",query_labels)]:
+            rr,cc=[],[]
+            for i,terms in enumerate(rows):
+                rr.extend([i]*len(terms));cc.extend(terms)
+            write_sparse_matrix(csr_matrix((np.ones(len(rr)),(rr,cc)),shape=(len(rows),100)),
+                                str(self.root/filename))
+        name="_test_pg_filter_ann"
+        ds=self.register(name,{"base":str(self.root/"base.bin"),"queries":str(self.root/"queries.bin"),
+                               "base_metadata":str(self.root/"base.meta"),
+                               "query_metadata":str(self.root/"query.meta")})
+        adapter=PGFilteredANN("euclidean",{"R":16,"L":64,"build_threads":2,"min_run_rows":0})
+        try:
+            adapter.fit(name)
+            schema=adapter.schema
+            snapshots=[]
+            for ceiling in (96,8):
+                adapter.set_query_arguments({"threads":2,"search_l":16,"initial_candidates":8,
+                                             "max_candidates":ceiling,"exact_cutoff":0})
+                adapter.filtered_query(queries,ds.get_queries_metadata(),5)
+                found=adapter.get_results()
+                np.testing.assert_array_equal(found[0],[80,82,84,86,88])
+                self.assertEqual(found[1,0],7)
+                np.testing.assert_array_equal(found[2],[-1]*5)
+                np.testing.assert_array_equal(found[3],[80,81,82,83,84])
+                self.assertTrue(adapter.stats["ann_plan_verified"])
+                self.assertGreater(adapter.stats["ann_queries"],0)
+                self.assertEqual(adapter.schema,schema)
+                if ceiling==8:
+                    self.assertGreaterEqual(adapter.stats["fallback_exact_queries"],2)
+                else:
+                    self.assertGreater(adapter.stats["ann_attempts"],adapter.stats["ann_queries"])
+                snapshots.append(adapter.get_additional())
+            for item in snapshots:
+                self.assertEqual(hashlib.sha256(Path(item["pg_events_file"]).read_bytes()).hexdigest(),
+                                 item["pg_events_sha256"])
+                self.assertTrue(item["native_ann"])
         finally:
             adapter.done()
 

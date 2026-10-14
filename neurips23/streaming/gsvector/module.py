@@ -69,14 +69,15 @@ def has_index_plan(plan, name="ann_idx"):
 
 class Gsvector(BaseStreamingANN):
     def __init__(self, metric, index_params):
-        metric = {"angular": "cosine", "normalized": "cosine"}.get(metric, metric)
-        if metric not in ("euclidean", "ip", "cosine"):
-            raise ValueError("gsvector-pg adapter supports native L2, IP or Cosine")
+        metric = {"angular": "cosine", "normalized": "cosine", "manhattan":"l1"}.get(metric, metric)
+        if metric not in ("euclidean", "ip", "cosine", "l1"):
+            raise ValueError("gsvector-pg adapter supports native L2, IP, Cosine or L1")
         self.metric = metric
         self.operator, self.opclass = {
             "euclidean": ("<->", "vector_l2_ops"),
             "ip": ("<#>", "vector_ip_ops"),
             "cosine": ("<=>", "vector_cosine_ops"),
+            "l1": ("<+>", "vector_l1_ops"),
         }[metric]
         self.params = dict(index_params)
         allowed = {"R", "L", "alpha", "build_threads", "batch_rows", "compact_runs", "min_run_rows"}

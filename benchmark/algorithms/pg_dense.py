@@ -5,6 +5,7 @@ datasets may be passed directly to fit(): only one bounded slice is materialized
 No upstream metric or result computation is replaced by this adapter.
 """
 import time
+import os
 
 import numpy as np
 import psycopg
@@ -17,12 +18,24 @@ from neurips23.streaming.gsvector.module import Gsvector, VectorBytes, encode_ve
 
 
 def canonical_metric(metric):
-    return {"angular": "cosine", "normalized": "cosine"}.get(metric, metric)
+    return {"angular": "cosine", "normalized": "cosine", "manhattan":"l1"}.get(metric, metric)
 
 
 class PGDenseANN(Gsvector):
     def track(self):
         return "none"
+
+    def load_index(self,dataset):
+        schema=os.environ.get("GSVECTOR_REUSE_SCHEMA")
+        if not schema:
+            return False
+        ds=DATASETS[dataset]()
+        if canonical_metric(ds.distance())!=self.metric:
+            raise ValueError("reused index metric does not match dataset")
+        self.attach(schema)
+        if self.dim!=ds.d or self.live_count!=ds.nb:
+            raise ValueError("reused index dimensions/row count do not match dataset")
+        return True
 
     def attach(self, schema):
         """Explicit read-only reuse of an existing benchmark index for A/B tests.
@@ -49,6 +62,13 @@ class PGDenseANN(Gsvector):
         self.max_pts = self.live_count
         self.vector_oid = self.conn.execute("SELECT 'vector'::regtype::oid").fetchone()[0]
         self.index_ready = self.mutated = True
+        self.reused_index = True
+        options=self.conn.execute("SELECT reloptions FROM pg_class WHERE oid=%s::regclass",
+                                  (f"{schema}.ann_idx",)).fetchone()[0] or []
+        options=dict(x.split("=",1) for x in options)
+        self.R=int(options.get("r",self.R))
+        self.L=int(options.get("l",self.L))
+        self.alpha=float(options.get("alpha",self.alpha))
         self._record("attach",dimension=self.dim,metric=self.metric,rows=self.live_count)
 
     def fit(self, dataset):
@@ -139,6 +159,7 @@ class PGDenseANN(Gsvector):
 
     def get_additional(self):
         return {**super().get_additional(), "native_ann": True,
+                "reused_index":getattr(self,"reused_index",False),
                 "execution_mode": f"gsvector-native-{self.metric}-ann",
                 "index_size_scope": "before/after fit PSS delta, not peak memory or disk size"}
 
