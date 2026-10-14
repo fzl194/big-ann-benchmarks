@@ -20,7 +20,7 @@ from .dataset_io import (
 )
 
 
-BASEDIR = "data/"
+BASEDIR = os.environ.get("BIGANN_DATA_DIR", "data/")
 
 
 class Dataset():
@@ -1592,3 +1592,9 @@ DATASETS = {
     'caselaw-1M': lambda: CaselawDataset(1000000),
     'caselaw-100K': lambda: CaselawDataset(100000),
 }
+
+# Local subsets must have distinct names: no implicit query truncation of an
+# official dataset. The optional JSON manifest contains only file paths/counts.
+if os.environ.get("BIGANN_LOCAL_DATASETS"):
+    from benchmark.local_dataset import register_local_datasets
+    register_local_datasets(DATASETS, os.environ["BIGANN_LOCAL_DATASETS"])

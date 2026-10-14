@@ -222,7 +222,8 @@ def main():
                 query_arguments = [query_arguments]
             fn = get_result_filename(args.dataset,
                                      args.count, definition,
-                                     query_arguments)
+                                     query_arguments, args.neurips23track,
+                                     args.runbook_path) + '.hdf5'
             if args.force or not os.path.exists(fn):
                 not_yet_run.append(query_arguments)
         if not_yet_run:

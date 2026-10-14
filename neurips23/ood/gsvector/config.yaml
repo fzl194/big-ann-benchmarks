@@ -1,0 +1,12 @@
+any:
+  gsvector:
+    docker-tag: neurips23-ood-gsvector
+    module: neurips23.ood.gsvector.module
+    constructor: GsvectorOOD
+    base-args: ["@metric"]
+    run-groups:
+      native-ip:
+        args: |
+          [{"R":32,"L":100,"build_threads":2,"batch_rows":32768}]
+        query-args: |
+          [{"search_l":200,"threads":4}]

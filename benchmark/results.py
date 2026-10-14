@@ -8,7 +8,7 @@ import traceback
 
 def get_result_filename(dataset=None, count=None, definition=None,
                         query_arguments=None, neurips23track=None, runbook_path=None):
-    d = ['results']
+    d = [os.environ.get("BIGANN_RESULTS_DIR", "results")]
     if neurips23track and neurips23track != 'none':
         d.append('neurips23')
         d.append(neurips23track)

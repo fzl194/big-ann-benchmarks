@@ -1,0 +1,12 @@
+any:
+  pg-filter-exact:
+    docker-tag: neurips23-filter-pg-exact
+    module: benchmark.algorithms.pg_exact
+    constructor: PGFilterExact
+    base-args: ["@metric"]
+    run-groups:
+      exact:
+        args: |
+          [{"batch_rows":4096}]
+        query-args: |
+          [{"threads":4}]

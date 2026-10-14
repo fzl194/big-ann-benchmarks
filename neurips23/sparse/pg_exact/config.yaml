@@ -1,0 +1,12 @@
+any:
+  pg-sparse-exact:
+    docker-tag: neurips23-sparse-pg-exact
+    module: benchmark.algorithms.pg_exact
+    constructor: PGSparseExact
+    base-args: ["@metric"]
+    run-groups:
+      exact:
+        args: |
+          [{"batch_rows":4096}]
+        query-args: |
+          [{"threads":4}]

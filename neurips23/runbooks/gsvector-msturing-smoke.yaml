@@ -1,0 +1,12 @@
+msturing-60k-streaming:
+  max_pts: 50000
+  1: {operation: insert, start: 0, end: 40000}
+  2: {operation: search}
+  3: {operation: delete, start: 0, end: 10000}
+  4: {operation: search}
+  5: {operation: replace, tags_start: 10000, tags_end: 20000, ids_start: 50000, ids_end: 60000}
+  6: {operation: search}
+  7: {operation: insert, start: 40000, end: 50000}
+  8: {operation: search}
+  9: {operation: insert, start: 0, end: 10000}
+  10: {operation: search}

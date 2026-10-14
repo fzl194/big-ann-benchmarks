@@ -65,6 +65,8 @@ class StreamingRunner(BaseRunner):
                 case _:
                     raise NotImplementedError('Invalid runbook operation.')
             step_time = (time.time() - start_time)
+            if entry['operation'] == 'search':
+                search_times.append(step_time)
             print(f"Step {step+1} took {step_time}s.")
 
         attrs = {
