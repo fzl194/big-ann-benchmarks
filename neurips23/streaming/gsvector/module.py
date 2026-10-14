@@ -69,11 +69,15 @@ def has_index_plan(plan, name="ann_idx"):
 
 class Gsvector(BaseStreamingANN):
     def __init__(self, metric, index_params):
-        if metric not in ("euclidean", "ip"):
-            raise ValueError("gsvector-pg adapter supports native L2 or IP only")
+        metric = {"angular": "cosine", "normalized": "cosine"}.get(metric, metric)
+        if metric not in ("euclidean", "ip", "cosine"):
+            raise ValueError("gsvector-pg adapter supports native L2, IP or Cosine")
         self.metric = metric
-        self.operator, self.opclass = (
-            ("<->", "vector_l2_ops") if metric == "euclidean" else ("<#>", "vector_ip_ops"))
+        self.operator, self.opclass = {
+            "euclidean": ("<->", "vector_l2_ops"),
+            "ip": ("<#>", "vector_ip_ops"),
+            "cosine": ("<=>", "vector_cosine_ops"),
+        }[metric]
         self.params = dict(index_params)
         allowed = {"R", "L", "alpha", "build_threads", "batch_rows", "compact_runs", "min_run_rows"}
         if set(self.params) - allowed:
@@ -114,8 +118,8 @@ class Gsvector(BaseStreamingANN):
     def setup(self, dtype, max_pts, ndims):
         if np.dtype(dtype) not in (np.dtype("float32"), np.dtype("uint8"), np.dtype("int8")):
             raise ValueError(f"unsupported source dtype: {dtype}")
-        if not 1 <= ndims <= 8000 or ndims % 2:
-            raise ValueError("this DiskANN adapter requires an even dimension <= 8000")
+        if not 1 <= ndims <= 8000:
+            raise ValueError("this DiskANN adapter requires a dimension in 1..8000")
         self.dim, self.max_pts = int(ndims), int(max_pts)
         if self.max_pts <= 0:
             raise ValueError("max_pts must be positive")
@@ -356,13 +360,17 @@ class Gsvector(BaseStreamingANN):
 
     def get_additional(self):
         events_path = self.artifacts / f"{self.run_id}-{self.schema}.jsonl"
+        # Static query sweeps append to the working log after earlier HDF5
+        # files have been stored. Hash an immutable snapshot per checkpoint.
+        snapshot = events_path.with_name(events_path.stem + f"-snapshot-{self.search_number}.jsonl")
+        snapshot.write_bytes(events_path.read_bytes())
         return {
             "pg_schema": self.schema,
             "pg_live_rows": self.live_count,
             # A full 1280-step runbook exceeds HDF5's small-attribute limit.
             # Keep detailed telemetry in the durable sidecar, not a giant attr.
-            "pg_events_file": str(events_path.resolve()),
-            "pg_events_sha256": hashlib.sha256(events_path.read_bytes()).hexdigest(),
+            "pg_events_file": str(snapshot.resolve()),
+            "pg_events_sha256": hashlib.sha256(snapshot.read_bytes()).hexdigest(),
             "pg_event_count": len(self.events),
             "pg_pss_kb_at_end": self.get_memory_usage(),
             "memory_accounting": (

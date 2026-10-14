@@ -1,4 +1,5 @@
 import os
+import hashlib
 from pathlib import Path
 import tempfile
 import unittest
@@ -8,6 +9,7 @@ import numpy as np
 from scipy.sparse import csr_matrix
 
 from benchmark.algorithms.pg_exact import PGFilterExact, PGSparseExact
+from benchmark.algorithms.pg_dense import PGDenseANN
 from benchmark.dataset_io import write_sparse_matrix
 from benchmark.datasets import DATASETS
 from benchmark.local_dataset import LocalDenseDataset, LocalCSRDataset
@@ -56,6 +58,36 @@ class StaticIntegrationTests(unittest.TestCase):
         spec["groundtruth_dir"] = str(self.root/"gt")
         DATASETS[name] = lambda: cls(name, spec)
         return DATASETS[name]()
+
+    def test_array_cosine_sweeps_and_remote_storage_accounting(self):
+        rng = np.random.default_rng(17)
+        base = rng.normal(size=(96, 31)).astype("float32")
+        adapter = PGDenseANN("angular", {"R":16, "L":64, "build_threads":2,
+                                         "min_run_rows":0})
+        try:
+            adapter.fit(base)
+            schema = adapter.schema
+            snapshots = []
+            for search_l in (100, 200):
+                adapter.set_query_arguments(search_l, 2)
+                found = adapter.query(base[7], 10)
+                self.assertEqual(found.shape, (10,))
+                self.assertEqual(found[0], 7)
+                adapter.batch_query(base[:3], 10)
+                np.testing.assert_array_equal(adapter.get_batch_results()[:,0],np.arange(3))
+                self.assertEqual(adapter.schema, schema)
+                snapshots.append(adapter.get_additional())
+            for snapshot in snapshots:
+                self.assertEqual(hashlib.sha256(Path(snapshot["pg_events_file"]).read_bytes()).hexdigest(),
+                                 snapshot["pg_events_sha256"])
+            storage = adapter.get_storage_usage()
+            self.assertGreater(storage["external_index_bytes"], 0)
+            self.assertGreater(storage["internal_relations_bytes"], 0)
+            self.assertEqual(storage["index_total_bytes"],
+                             storage["external_index_bytes"]+storage["internal_relations_bytes"]
+                             +storage["pg_index_bytes"])
+        finally:
+            adapter.done()
 
     def test_native_ip_and_query_arg_sweep(self):
         base = np.zeros((96, 200), dtype="float32")

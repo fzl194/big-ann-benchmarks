@@ -38,7 +38,7 @@ class EncodingTests(unittest.TestCase):
 
     def test_metric_and_connection_fail_loudly(self):
         with self.assertRaises(ValueError):
-            Gsvector("angular", {})
+            Gsvector("unsupported-metric", {})
         with patch.dict(os.environ, {}, clear=True), self.assertRaises(ValueError):
             Gsvector("euclidean", {})
 
