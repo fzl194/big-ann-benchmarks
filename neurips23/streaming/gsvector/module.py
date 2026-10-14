@@ -80,7 +80,7 @@ class Gsvector(BaseStreamingANN):
             "l1": ("<+>", "vector_l1_ops"),
         }[metric]
         self.params = dict(index_params)
-        allowed = {"R", "L", "alpha", "build_threads", "batch_rows", "compact_runs", "min_run_rows"}
+        allowed = {"R", "L", "alpha", "build_threads", "batch_rows", "compact_runs", "min_run_rows", "compaction"}
         if set(self.params) - allowed:
             raise ValueError(f"unknown index parameters: {set(self.params) - allowed}")
         self.R = int(self.params.get("R", 32))
@@ -89,6 +89,9 @@ class Gsvector(BaseStreamingANN):
         self.build_threads = int(self.params.get("build_threads", 2))
         self.batch_rows = int(self.params.get("batch_rows", 32768))
         self.compact_runs = int(self.params.get("compact_runs", 8))
+        self.compaction = self.params.get("compaction", "full")
+        if self.compaction not in ("full", "tiered"):
+            raise ValueError("compaction must be full or tiered")
         self.min_run_rows = int(self.params.get("min_run_rows", 32768))
         if not (1 <= self.R <= self.L <= 4096 and 1 <= self.alpha <= 4):
             raise ValueError("invalid R/L/alpha")
@@ -151,7 +154,8 @@ class Gsvector(BaseStreamingANN):
         for name, value in {
             "gsvector.build_threads": self.build_threads,
             "gsvector.min_run_rows": self.min_run_rows,
-            "gsvector.flush_threshold": self.batch_rows,
+            "gsvector.flush_threshold": min(self.batch_rows, 1000000),
+            "gsvector.merge_runs": min(self.compact_runs,1024),
         }.items():
             self.conn.execute("SELECT set_config(%s,%s,false)", (name, str(value)))
         self._record("setup", dimension=self.dim, max_pts=self.max_pts,
@@ -216,12 +220,25 @@ class Gsvector(BaseStreamingANN):
         # All calls autocommit: run-list publication occurs at transaction commit.
         # With gsvector.worker=off, parallel VACUUM deliberately skips inline
         # drain. Serialize maintenance before reusing the other memtable slot.
+        index = f"{self.schema}.ann_idx"
         self.conn.execute("VACUUM (PARALLEL 0) base")
-        self.conn.execute("SELECT gsvector_flush(%s::regclass)", (f"{self.schema}.ann_idx",))
+        # VACUUM may itself seal on row/time thresholds. Drain that slot before
+        # explicitly sealing again: the original sequence failed at step 21 of
+        # the official runbook. Calls commit individually; no hidden retries.
+        self.conn.execute("SELECT gsvector_drain(%s::regclass)", (index,))
+        self.conn.execute("SELECT gsvector_flush(%s::regclass)", (index,))
+        self.conn.execute("SELECT gsvector_drain(%s::regclass)", (index,))
         self.conn.execute("VACUUM (PARALLEL 0) base")
         runs = self._runs()
         if len(runs) >= self.compact_runs:
-            self.conn.execute("SELECT gsvector_compact(%s::regclass)", (f"{self.schema}.ann_idx",))
+            if self.compaction == "full":
+                self.conn.execute("SELECT gsvector_compact(%s::regclass)", (index,))
+            else:
+                # Each successful tier pass reduces run count; never rewrite a
+                # lone large run merely because small runs accumulated.
+                for _ in range(len(runs)):
+                    if not self.conn.execute("SELECT gsvector_compact(%s::regclass,false)", (index,)).fetchone()[0]:
+                        break
 
     def insert(self, X, ids):
         start = time.perf_counter()

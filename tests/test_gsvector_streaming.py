@@ -45,6 +45,28 @@ class EncodingTests(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get("GSVECTOR_PG_DSN"), "requires dedicated test PostgreSQL")
 class PostgreSQLTests(unittest.TestCase):
+    def test_threshold_seal_then_explicit_maintenance(self):
+        rng=np.random.default_rng(189)
+        vectors=rng.normal(size=(2144,16)).astype("float32")
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
+            "GSVECTOR_ARTIFACTS":directory,"GSVECTOR_KEEP_SCHEMA":"0",
+        }):
+            adapter=Gsvector("euclidean",{"R":16,"L":32,"min_run_rows":0,
+                "batch_rows":1024,"build_threads":2,"compact_runs":4})
+            try:
+                adapter.setup("float32",len(vectors),16)
+                adapter.insert(vectors[:96],np.arange(96,dtype=np.uint32))
+                adapter.query(vectors[:2],10)
+                # These full-size batches trigger automatic sealing during
+                # VACUUM. The following explicit maintenance must drain first.
+                for lo in (96,1120):
+                    adapter.insert(vectors[lo:lo+1024],np.arange(lo,lo+1024,dtype=np.uint32))
+                    adapter.query(vectors[lo:lo+2],10)
+                    np.testing.assert_array_equal(adapter.get_results()[:,0],np.arange(lo,lo+2))
+                self.assertEqual(adapter.live_count,len(vectors))
+            finally:
+                adapter.done()
+
     def test_mutations_queries_and_parameter_replay(self):
         rng = np.random.default_rng(42)
         vectors = rng.normal(size=(160, 100)).astype("float32")
