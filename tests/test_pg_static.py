@@ -68,11 +68,14 @@ class StaticIntegrationTests(unittest.TestCase):
             adapter.fit(base)
             schema = adapter.schema
             snapshots = []
+            backend = adapter.conn.execute("SELECT pg_backend_pid()").fetchone()[0]
             for search_l in (100, 200):
                 adapter.set_query_arguments(search_l, 2)
-                found = adapter.query(base[7], 10)
+                with patch("psycopg.connect",side_effect=AssertionError("single query opened a new backend")):
+                    found = adapter.query(base[7], 10)
                 self.assertEqual(found.shape, (10,))
                 self.assertEqual(found[0], 7)
+                self.assertEqual(adapter.conn.execute("SELECT pg_backend_pid()").fetchone()[0],backend)
                 adapter.batch_query(base[:3], 10)
                 np.testing.assert_array_equal(adapter.get_batch_results()[:,0],np.arange(3))
                 self.assertEqual(adapter.schema, schema)
@@ -86,6 +89,20 @@ class StaticIntegrationTests(unittest.TestCase):
             self.assertEqual(storage["index_total_bytes"],
                              storage["external_index_bytes"]+storage["internal_relations_bytes"]
                              +storage["pg_index_bytes"])
+            attached = PGDenseANN("cosine", {})
+            try:
+                attached.attach(schema)
+                self.assertEqual(attached.query(base[7],10)[0],7)
+                self.assertEqual(attached.live_count,len(base))
+            finally:
+                attached.done()
+            self.assertEqual(adapter.conn.execute("SELECT count(*) FROM base").fetchone()[0],len(base))
+            mismatched = PGDenseANN("ip", {})
+            try:
+                with self.assertRaises(ValueError):
+                    mismatched.attach(schema)
+            finally:
+                mismatched.done()
         finally:
             adapter.done()
 
