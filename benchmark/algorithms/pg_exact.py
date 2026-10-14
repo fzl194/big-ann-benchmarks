@@ -95,7 +95,11 @@ class PGExactBase(BaseANN):
         return {"execution_mode": self.mode, "native_ann": False, "pg_schema": self.schema,
                 "pg_events_file": str(self.log.resolve()),
                 "pg_events_sha256": hashlib.sha256(self.log.read_bytes()).hexdigest(),
-                "threads": self.threads}
+                "threads": self.threads,
+                "memory_accounting": (
+                    "Python and local PG process-tree PSS, not peak memory"
+                    if os.environ.get("GSVECTOR_PG_PIDFILE") else
+                    "Python client only; external PostgreSQL memory is NOT measured")}
 
     def done(self):
         if self.conn is not None:

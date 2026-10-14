@@ -365,7 +365,10 @@ class Gsvector(BaseStreamingANN):
             "pg_events_sha256": hashlib.sha256(events_path.read_bytes()).hexdigest(),
             "pg_event_count": len(self.events),
             "pg_pss_kb_at_end": self.get_memory_usage(),
-            "memory_accounting": "Python and PG process-tree PSS when GSVECTOR_PG_PIDFILE is supplied",
+            "memory_accounting": (
+                "Python and local PG process-tree PSS, not peak memory"
+                if os.environ.get("GSVECTOR_PG_PIDFILE") else
+                "Python client only; external PostgreSQL memory is NOT measured"),
             "index_size_scope": "framework index_size is setup-time delta, not peak streaming memory",
         }
 
