@@ -130,6 +130,28 @@ class StaticIntegrationTests(unittest.TestCase):
         finally:
             adapter.done()
 
+    def test_random_io_arguments_restore_connection_defaults(self):
+        data=np.random.default_rng(913).normal(size=(96,16)).astype("float32")
+        adapter=PGDenseANN("euclidean",{"R":16,"L":64,"build_threads":2,"min_run_rows":0})
+        try:
+            adapter.fit(data)
+            initial=adapter.conn.execute("SHOW gsvector.query_random_io").fetchone()[0]
+            adapter.set_query_arguments({"search_l":200,"threads":2})
+            expected=adapter.query(data[0],10).copy()
+            for value in (True,False,None):
+                args={"search_l":200,"threads":2}
+                if value is not None:args["random_io"]=value
+                adapter.set_query_arguments(args)
+                np.testing.assert_array_equal(adapter.query(data[0],10),expected)
+                current=adapter.conn.execute("SHOW gsvector.query_random_io").fetchone()[0]
+                self.assertEqual(current,initial if value is None else "on" if value else "off")
+                adapter.batch_query(data[:4],10)
+                np.testing.assert_array_equal(adapter.get_batch_results()[:,0],np.arange(4))
+            with self.assertRaises(ValueError):
+                adapter.set_query_arguments({"random_io":"off"})
+        finally:
+            adapter.done()
+
     def test_native_l1_is_not_l2(self):
         base=np.full((96,8),100,dtype=np.float32)
         base[:,0]+=np.arange(96)

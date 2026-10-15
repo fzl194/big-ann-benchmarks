@@ -295,8 +295,10 @@ class Gsvector(BaseStreamingANN):
 
     def _set_query_arguments(self, query_args, reset_workload):
         args = dict(query_args)
-        if set(args) - {"search_l", "threads"}:
+        if set(args) - {"search_l", "threads", "random_io"}:
             raise ValueError(f"unknown query arguments: {args}")
+        if "random_io" in args and not isinstance(args["random_io"], bool):
+            raise ValueError("random_io must be boolean")
         search_l = int(args.get("search_l", 200))
         threads = int(args.get("threads", 4))
         if search_l < 1 or threads < 1:
@@ -305,6 +307,19 @@ class Gsvector(BaseStreamingANN):
         if self.mutated and reset_workload:
             self._new_workload()
         self.query_args = {"search_l": search_l, "threads": threads}
+        if "random_io" in args:
+            self.query_args["random_io"] = args["random_io"]
+
+    def _apply_random_io(self, conn):
+        # Omitted option inherits the connection default (including PGOPTIONS).
+        # Persistent single-query sessions must undo a previous explicit value.
+        if "random_io" in self.query_args:
+            conn.execute("SELECT set_config('gsvector.query_random_io',%s,false)",
+                         ("on" if self.query_args["random_io"] else "off",))
+        elif conn is self.conn and getattr(self,"_single_random_io_overridden",False):
+            conn.execute("RESET gsvector.query_random_io")
+        if conn is self.conn:
+            self._single_random_io_overridden = "random_io" in self.query_args
 
     def _query_chunk(self, queries, k):
         with psycopg.connect(self.dsn, autocommit=True) as conn:
@@ -323,6 +338,7 @@ class Gsvector(BaseStreamingANN):
             conn.execute("SET gsvector.query_beam_first=on")
             conn.execute("SELECT set_config('gsvector.search_l',%s,false)",
                          (str(self.query_args["search_l"]),))
+            self._apply_random_io(conn)
             statement = f"SELECT id FROM base ORDER BY embedding {self.operator} %s LIMIT %s"
             if len(queries):
                 plan = conn.execute("EXPLAIN (FORMAT JSON) " + statement,
