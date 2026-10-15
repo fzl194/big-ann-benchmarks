@@ -32,6 +32,17 @@ msturing-30M-clustered:
           [{"R":24,"L":64,"build_threads":8,"batch_rows":32768,"compact_runs":4,"min_run_rows":0,"compaction":"tiered"}]
         query-args: |
           [{"search_l":200,"threads":16}]
+  gsvector-streaming-batched:
+    docker-tag: neurips23-streaming-gsvector
+    module: neurips23.streaming.gsvector.module
+    constructor: Gsvector
+    base-args: ["@metric"]
+    run-groups:
+      experimental:
+        args: |
+          [{"R":24,"L":64,"build_threads":8,"batch_rows":1000000,"compact_runs":4,"min_run_rows":0,"compaction":"tiered"}]
+        query-args: |
+          [{"search_l":200,"threads":4,"reuse_connections":true}]
 random-xs:
   gsvector:
     docker-tag: neurips23-streaming-gsvector

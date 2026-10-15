@@ -12,6 +12,8 @@ import struct
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+import threading
 
 import numpy as np
 import psycopg
@@ -80,7 +82,8 @@ class Gsvector(BaseStreamingANN):
             "l1": ("<+>", "vector_l1_ops"),
         }[metric]
         self.params = dict(index_params)
-        allowed = {"R", "L", "alpha", "build_threads", "batch_rows", "compact_runs", "min_run_rows", "compaction"}
+        allowed = {"R", "L", "alpha", "build_threads", "batch_rows", "compact_runs",
+                   "min_run_rows", "compaction"}
         if set(self.params) - allowed:
             raise ValueError(f"unknown index parameters: {set(self.params) - allowed}")
         self.R = int(self.params.get("R", 32))
@@ -110,8 +113,12 @@ class Gsvector(BaseStreamingANN):
         self.schemas = []
         self.conn = None
         self.pool = None
+        self._query_local = threading.local()
+        self._query_connections = []
+        self._query_connections_lock = threading.Lock()
         self.schema = None
         self.events = []
+        self.maintenance_totals = {}
         self.search_number = 0
         self.mutated = False
         self.live_count = 0
@@ -134,11 +141,10 @@ class Gsvector(BaseStreamingANN):
         self._new_workload()
 
     def _new_workload(self):
-        if self.pool is not None:
-            self.pool.shutdown(wait=True)
-            self.pool = None
+        self._close_query_pool()
         self.schema = "annbench_" + uuid.uuid4().hex
         self.events = []
+        self.maintenance_totals = {}
         self.search_number = 0
         self.mutated = False
         self.live_count = 0
@@ -161,8 +167,37 @@ class Gsvector(BaseStreamingANN):
         self._record("setup", dimension=self.dim, max_pts=self.max_pts,
                      metric=self.metric, parameters=self.params)
 
+    def _close_query_pool(self):
+        # Workers must stop before their backend handles are closed. Autocommit
+        # sessions retain no snapshot across mutation/checkpoint boundaries.
+        if self.pool is not None:
+            self.pool.shutdown(wait=True)
+            self.pool = None
+        for connection in self._query_connections:
+            connection.close()
+        self._query_connections.clear()
+        self._query_local = threading.local()
+
+    @contextmanager
+    def _query_connection(self):
+        if not self.query_args.get("reuse_connections", False):
+            with psycopg.connect(self.dsn, autocommit=True) as connection:
+                yield connection
+            return
+        connection = getattr(self._query_local, "connection", None)
+        if connection is None:
+            connection = psycopg.connect(self.dsn, autocommit=True)
+            self._query_local.connection = connection
+            with self._query_connections_lock:
+                self._query_connections.append(connection)
+        # Do not retry failed queries: that would hide correctness failures and
+        # alter measured workload semantics.
+        yield connection
+
     def _record(self, operation, **data):
         event = {"operation": operation, "live_rows": self.live_count, **data}
+        if operation in ("insert", "replace", "delete"):
+            event["maintenance_totals"] = dict(self.maintenance_totals)
         self.events.append(event)
         with (self.artifacts / f"{self.run_id}-{self.schema}.jsonl").open("a") as stream:
             stream.write(json.dumps(event) + "\n")
@@ -221,23 +256,37 @@ class Gsvector(BaseStreamingANN):
         # With gsvector.worker=off, parallel VACUUM deliberately skips inline
         # drain. Serialize maintenance before reusing the other memtable slot.
         index = f"{self.schema}.ann_idx"
-        self.conn.execute("VACUUM (PARALLEL 0) base")
+        def execute(stage, statement, args=None):
+            started = time.perf_counter()
+            try:
+                return self.conn.execute(statement, args)
+            finally:
+                self.maintenance_totals[stage + "_s"] = (
+                    self.maintenance_totals.get(stage + "_s", 0.0)
+                    + time.perf_counter() - started)
+                self.maintenance_totals[stage + "_calls"] = (
+                    self.maintenance_totals.get(stage + "_calls", 0) + 1)
+
+        # VACUUM also recycles drained internal memtable storage. Omitting it
+        # made a measured streaming prefix slower despite cheaper inserts.
+        execute("vacuum", "VACUUM (PARALLEL 0) base")
         # VACUUM may itself seal on row/time thresholds. Drain that slot before
         # explicitly sealing again: the original sequence failed at step 21 of
         # the official runbook. Calls commit individually; no hidden retries.
-        self.conn.execute("SELECT gsvector_drain(%s::regclass)", (index,))
-        self.conn.execute("SELECT gsvector_flush(%s::regclass)", (index,))
-        self.conn.execute("SELECT gsvector_drain(%s::regclass)", (index,))
-        self.conn.execute("VACUUM (PARALLEL 0) base")
+        execute("drain", "SELECT gsvector_drain(%s::regclass)", (index,))
+        execute("flush", "SELECT gsvector_flush(%s::regclass)", (index,))
+        execute("drain", "SELECT gsvector_drain(%s::regclass)", (index,))
+        execute("vacuum", "VACUUM (PARALLEL 0) base")
         runs = self._runs()
         if len(runs) >= self.compact_runs:
             if self.compaction == "full":
-                self.conn.execute("SELECT gsvector_compact(%s::regclass)", (index,))
+                execute("compact", "SELECT gsvector_compact(%s::regclass)", (index,))
             else:
                 # Each successful tier pass reduces run count; never rewrite a
                 # lone large run merely because small runs accumulated.
                 for _ in range(len(runs)):
-                    if not self.conn.execute("SELECT gsvector_compact(%s::regclass,false)", (index,)).fetchone()[0]:
+                    if not execute("compact", "SELECT gsvector_compact(%s::regclass,false)",
+                                   (index,)).fetchone()[0]:
                         break
 
     def insert(self, X, ids):
@@ -295,10 +344,11 @@ class Gsvector(BaseStreamingANN):
 
     def _set_query_arguments(self, query_args, reset_workload):
         args = dict(query_args)
-        if set(args) - {"search_l", "threads", "random_io"}:
+        if set(args) - {"search_l", "threads", "random_io", "reuse_connections"}:
             raise ValueError(f"unknown query arguments: {args}")
-        if "random_io" in args and not isinstance(args["random_io"], bool):
-            raise ValueError("random_io must be boolean")
+        for name in ("random_io", "reuse_connections"):
+            if name in args and not isinstance(args[name], bool):
+                raise ValueError(f"{name} must be boolean")
         search_l = int(args.get("search_l", 200))
         threads = int(args.get("threads", 4))
         if search_l < 1 or threads < 1:
@@ -306,9 +356,13 @@ class Gsvector(BaseStreamingANN):
         # Official runner replays the runbook for each argument group.
         if self.mutated and reset_workload:
             self._new_workload()
+        elif (threads != self.query_args["threads"] or
+              args.get("reuse_connections", False) != self.query_args.get("reuse_connections", False)):
+            self._close_query_pool()
         self.query_args = {"search_l": search_l, "threads": threads}
-        if "random_io" in args:
-            self.query_args["random_io"] = args["random_io"]
+        for name in ("random_io", "reuse_connections"):
+            if name in args:
+                self.query_args[name] = args[name]
 
     def _apply_random_io(self, conn):
         # Omitted option inherits the connection default (including PGOPTIONS).
@@ -318,11 +372,13 @@ class Gsvector(BaseStreamingANN):
                          ("on" if self.query_args["random_io"] else "off",))
         elif conn is self.conn and getattr(self,"_single_random_io_overridden",False):
             conn.execute("RESET gsvector.query_random_io")
+        elif conn is not self.conn and self.query_args.get("reuse_connections", False):
+            conn.execute("RESET gsvector.query_random_io")
         if conn is self.conn:
             self._single_random_io_overridden = "random_io" in self.query_args
 
     def _query_chunk(self, queries, k):
-        with psycopg.connect(self.dsn, autocommit=True) as conn:
+        with self._query_connection() as conn:
             class VectorDumper(Dumper):
                 oid = self.vector_oid
                 format = Format.BINARY
@@ -338,6 +394,7 @@ class Gsvector(BaseStreamingANN):
             conn.execute("SET gsvector.query_beam_first=on")
             conn.execute("SELECT set_config('gsvector.search_l',%s,false)",
                          (str(self.query_args["search_l"]),))
+            conn.execute("SELECT set_config('gsvector.scan_target_k',%s,false)", (str(k),))
             self._apply_random_io(conn)
             statement = f"SELECT id FROM base ORDER BY embedding {self.operator} %s LIMIT %s"
             if len(queries):
@@ -415,8 +472,7 @@ class Gsvector(BaseStreamingANN):
         }
 
     def done(self):
-        if self.pool is not None:
-            self.pool.shutdown(wait=True)
+        self._close_query_pool()
         if self.conn is not None:
             try:
                 if not self.keep_schema:

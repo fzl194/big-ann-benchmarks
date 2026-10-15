@@ -109,10 +109,10 @@ def xbin_mmap(fname, dtype, maxn=-1):
     return np.memmap(fname, dtype=dtype, mode="r", offset=8, shape=(n, d))
 
 def xbin_write(x, fname):
-    f = open(fname, "wb")
-    n, d = x.shape
-    np.array([n, d], dtype='uint32').tofile(f)
-    x.tofile(f)
+    with open(fname, "wb") as f:
+        n, d = x.shape
+        np.array([n, d], dtype='uint32').tofile(f)
+        x.tofile(f)
 
 def u8bin_write(x, fname):
     assert x.dtype == "uint8"

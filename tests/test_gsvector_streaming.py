@@ -45,6 +45,58 @@ class EncodingTests(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get("GSVECTOR_PG_DSN"), "requires dedicated test PostgreSQL")
 class PostgreSQLTests(unittest.TestCase):
+    def test_reused_connections_follow_mutations_and_close_on_reset(self):
+        rng = np.random.default_rng(20261015)
+        vectors = rng.normal(size=(160, 16)).astype("float32")
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
+            "GSVECTOR_ARTIFACTS": directory, "GSVECTOR_KEEP_SCHEMA": "0",
+        }):
+            adapter = Gsvector("euclidean", {
+                "R": 16, "L": 64, "min_run_rows": 0, "batch_rows": 32,
+                "build_threads": 2, "compact_runs": 4,
+            })
+            try:
+                adapter.setup("float32", 160, 16)
+                adapter.set_query_arguments({"search_l": 200, "threads": 2,
+                                             "reuse_connections": True})
+                adapter.insert(vectors[:96], np.arange(96, dtype=np.uint32))
+                adapter.query(vectors[:8], 10)
+                np.testing.assert_array_equal(adapter.get_results()[:, 0], np.arange(8))
+                connections = list(adapter._query_connections)
+                self.assertTrue(connections)
+                adapter.query(vectors[:8], 10)
+                self.assertEqual(adapter._query_connections, connections)
+                adapter.delete(np.arange(16, dtype=np.uint32))
+                adapter.replace(vectors[96:112], np.arange(16, 32, dtype=np.uint32))
+                adapter.query(vectors[96:104], 10)
+                np.testing.assert_array_equal(adapter.get_results()[:, 0], np.arange(16, 24))
+                self.assertFalse(np.any(adapter.get_results() < 16))
+                adapter.insert(vectors[:16], np.arange(16, dtype=np.uint32))
+                vacuum_calls = adapter.maintenance_totals["vacuum_calls"]
+                adapter.insert(vectors[112:144], np.arange(112, 144, dtype=np.uint32))
+                self.assertGreater(adapter.maintenance_totals["vacuum_calls"], vacuum_calls)
+                adapter.query(vectors[:8], 10)
+                np.testing.assert_array_equal(adapter.get_results()[:, 0], np.arange(8))
+                # Change session settings without replaying the workload.
+                adapter._set_query_arguments({"search_l": 100, "threads": 2,
+                    "reuse_connections": True, "random_io": True}, reset_workload=False)
+                adapter.query(vectors[:8], 10)
+                adapter._set_query_arguments({"search_l": 100, "threads": 2,
+                    "reuse_connections": True}, reset_workload=False)
+                adapter.query(vectors[:8], 10)
+                for connection in connections:
+                    self.assertEqual(connection.execute(
+                        "SHOW gsvector.query_random_io").fetchone()[0], "off")
+                adapter.set_query_arguments({"search_l": 100, "threads": 1})
+                self.assertTrue(all(connection.closed for connection in connections))
+                self.assertEqual(adapter.live_count, 0)
+                adapter.insert(vectors[:32], np.arange(32, dtype=np.uint32))
+                adapter.query(vectors[:4], 10)
+                np.testing.assert_array_equal(adapter.get_results()[:, 0], np.arange(4))
+            finally:
+                adapter.done()
+            self.assertFalse(adapter._query_connections)
+
     def test_threshold_seal_then_explicit_maintenance(self):
         rng=np.random.default_rng(189)
         vectors=rng.normal(size=(2144,16)).astype("float32")
