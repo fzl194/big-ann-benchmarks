@@ -87,6 +87,7 @@ class PGDenseANN(Gsvector):
             blocks = (dataset[i:i+self.batch_rows] for i in range(0, rows, self.batch_rows))
         self.setup(dtype, rows, dim)
         offset = 0
+        next_progress = 1_000_000
         for block in blocks:
             ids = np.arange(offset, offset + len(block), dtype=np.int64)
             self._validate_vectors(block, ids)
@@ -94,9 +95,14 @@ class PGDenseANN(Gsvector):
                 self._copy("base", block, ids)
             offset += len(block)
             self.live_count = offset
+            if offset >= next_progress:
+                self._record("load_progress", rows=offset,
+                             elapsed_s=time.perf_counter()-started)
+                next_progress = (offset // 1_000_000 + 1) * 1_000_000
         if offset != rows:
             raise ValueError("dataset iterator returned the wrong row count")
         load_done = time.perf_counter()
+        self._record("load", rows=offset, elapsed_s=load_done-started)
         self._build_index()
         self.build_times = {"load_s": load_done-started,
                             "index_s": time.perf_counter()-load_done}
