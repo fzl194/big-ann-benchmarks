@@ -83,13 +83,20 @@ class Gsvector(BaseStreamingANN):
         }[metric]
         self.params = dict(index_params)
         allowed = {"R", "L", "alpha", "build_threads", "batch_rows", "compact_runs",
-                   "min_run_rows", "compaction", "compact_max_rows"}
+                   "min_run_rows", "compaction", "compact_max_rows", "build_beam_first",
+                   "build_neighbor_codes"}
         if set(self.params) - allowed:
             raise ValueError(f"unknown index parameters: {set(self.params) - allowed}")
         self.R = int(self.params.get("R", 32))
         self.L = int(self.params.get("L", 100))
         self.alpha = float(self.params.get("alpha", 1.2))
         self.build_threads = int(self.params.get("build_threads", 2))
+        self.build_beam_first = self.params.get("build_beam_first", False)
+        if not isinstance(self.build_beam_first, bool):
+            raise ValueError("build_beam_first must be boolean")
+        self.build_neighbor_codes = self.params.get("build_neighbor_codes", True)
+        if not isinstance(self.build_neighbor_codes, bool):
+            raise ValueError("build_neighbor_codes must be boolean")
         self.batch_rows = int(self.params.get("batch_rows", 32768))
         self.compact_runs = int(self.params.get("compact_runs", 8))
         self.compact_max_rows = int(self.params.get("compact_max_rows", 0))
@@ -170,6 +177,12 @@ class Gsvector(BaseStreamingANN):
         if "compact_max_rows" in self.params:
             self.conn.execute("SELECT set_config('gsvector.compact_max_rows',%s,false)",
                               (str(self.compact_max_rows),))
+        if "build_beam_first" in self.params:
+            self.conn.execute("SELECT set_config('gsvector.build_beam_first',%s,false)",
+                              ("on" if self.build_beam_first else "off",))
+        if "build_neighbor_codes" in self.params:
+            self.conn.execute("SELECT set_config('gsvector.build_neighbor_codes',%s,false)",
+                              ("on" if self.build_neighbor_codes else "off",))
         self._record("setup", dimension=self.dim, max_pts=self.max_pts,
                      metric=self.metric, parameters=self.params)
 
@@ -445,10 +458,20 @@ class Gsvector(BaseStreamingANN):
         futures = [self.pool.submit(self._query_chunk, chunk, k) for chunk in chunks]
         self.res = (np.concatenate([future.result() for future in futures]) if chunks else
                     np.empty((0, k), dtype=np.int32))
-        elapsed = time.perf_counter() - start
         self.search_number += 1
+        evidence = {}
+        if os.environ.get("GSVECTOR_SAVE_CHECKPOINTS") == "1":
+            directory = self.artifacts / f"{self.run_id}-{self.schema}-checkpoints"
+            directory.mkdir(parents=True, exist_ok=True)
+            path = directory / f"search-{self.search_number:04d}.npy"
+            temporary = path.with_suffix(".npy.tmp")
+            with temporary.open("xb") as stream:
+                np.save(stream, self.res, allow_pickle=False)
+            temporary.replace(path)
+            evidence["checkpoint_file"] = str(path.resolve())
+        elapsed = time.perf_counter() - start  # diagnostic persistence is included
         self._record("search", checkpoint=self.search_number, queries=len(X), k=k, elapsed_s=elapsed,
-                     query_args=self.query_args, runs=self._runs())
+                     query_args=self.query_args, runs=self._runs(), **evidence)
 
     def get_memory_usage(self):
         # Sum PSS, not RSS (PostgreSQL shared pages must not be counted per backend).

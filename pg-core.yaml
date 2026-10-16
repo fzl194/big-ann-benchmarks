@@ -28,3 +28,14 @@ any:
           200, "threads": 4, "random_io": true}, {"search_l": 400, "threads": 4, "random_io":
           true}, {"search_l": 800, "threads": 4, "random_io": true}, {"search_l":
           1600, "threads": 4, "random_io": true}]'
+  gsvector-fast-build:
+    docker-tag: gsvector-core-submission-pending
+    module: benchmark.algorithms.pg_dense
+    constructor: PGDenseANN
+    base-args: ["@metric"]
+    run-groups:
+      experimental-bestfirst-codeoff:
+        args: |
+          [{"R":24,"L":64,"build_threads":4,"batch_rows":32768,"min_run_rows":0,"build_beam_first":true,"build_neighbor_codes":false}]
+        query-args: |
+          [{"search_l":100,"threads":4},{"search_l":200,"threads":4},{"search_l":400,"threads":4},{"search_l":800,"threads":4},{"search_l":1600,"threads":4}]

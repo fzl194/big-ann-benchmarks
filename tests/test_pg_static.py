@@ -195,6 +195,12 @@ class StaticIntegrationTests(unittest.TestCase):
             adapter.done()
 
     def test_adaptive_filtered_ann_expansion_and_explicit_fallback(self):
+        self._check_adaptive_filtered_ann({})
+
+    def test_filtered_optional_build_strategy_and_layout(self):
+        self._check_adaptive_filtered_ann({"build_beam_first":True,"build_neighbor_codes":False})
+
+    def _check_adaptive_filtered_ann(self,build_options):
         base=np.zeros((96,32),dtype=np.float32)
         base[:,0]=np.arange(96)
         queries=base[[0,7,0,0]]
@@ -212,9 +218,13 @@ class StaticIntegrationTests(unittest.TestCase):
         ds=self.register(name,{"base":str(self.root/"base.bin"),"queries":str(self.root/"queries.bin"),
                                "base_metadata":str(self.root/"base.meta"),
                                "query_metadata":str(self.root/"query.meta")})
-        adapter=PGFilteredANN("euclidean",{"R":16,"L":64,"build_threads":2,"min_run_rows":0})
+        adapter=PGFilteredANN("euclidean",{"R":16,"L":64,"build_threads":2,"min_run_rows":0,
+                                          **build_options})
         try:
             adapter.fit(name)
+            for option,value in build_options.items():
+                self.assertEqual(adapter.conn.execute("SHOW gsvector."+option).fetchone()[0],
+                                 "on" if value else "off")
             schema=adapter.schema
             snapshots=[]
             for ceiling in (96,8):

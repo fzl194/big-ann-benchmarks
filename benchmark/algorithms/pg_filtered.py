@@ -22,7 +22,8 @@ class PGFilteredANN(PGFilterExact):
 
     def __init__(self,metric,index_params):
         params=dict(index_params)
-        allowed={"batch_rows","R","L","alpha","build_threads","min_run_rows"}
+        allowed={"batch_rows","R","L","alpha","build_threads","min_run_rows",
+                 "build_beam_first","build_neighbor_codes"}
         if set(params)-allowed:
             raise ValueError("unsupported filtered ANN build parameters")
         super().__init__(metric,{"batch_rows":params.get("batch_rows",4096)})
@@ -31,6 +32,10 @@ class PGFilteredANN(PGFilterExact):
         self.alpha=float(params.get("alpha",1.2))
         self.build_threads=int(params.get("build_threads",4))
         self.min_run_rows=int(params.get("min_run_rows",32768))
+        self.build_options={name:params[name] for name in ("build_beam_first","build_neighbor_codes")
+                            if name in params}
+        if any(not isinstance(value,bool) for value in self.build_options.values()):
+            raise ValueError("build strategy/layout options must be boolean")
         if (not 1<=self.R<=self.L<=4096 or not 1<=self.alpha<=4 or
                 self.build_threads<1 or self.min_run_rows<0):
             raise ValueError("invalid filtered ANN build parameters")
@@ -47,13 +52,16 @@ class PGFilteredANN(PGFilterExact):
                           (str(self.build_threads),))
         self.conn.execute("SELECT set_config('gsvector.min_run_rows',%s,false)",
                           (str(self.min_run_rows),))
+        for name,value in self.build_options.items():
+            self.conn.execute("SELECT set_config(%s,%s,false)",("gsvector."+name,"on" if value else "off"))
         self.conn.execute(sql.SQL(
             "CREATE INDEX ann_idx ON base USING gsvector(embedding vector_l2_ops) "
             "WITH(engine='diskann',r={},l={},alpha={})"
         ).format(sql.Literal(self.R),sql.Literal(self.L),sql.Literal(self.alpha)))
         self.build_times={"load_and_gin_s":loaded-start,
                           "ann_index_s":time.perf_counter()-loaded}
-        self._record("ann_fit",rows=self.nb,parameters={"R":self.R,"L":self.L,"alpha":self.alpha},
+        self._record("ann_fit",rows=self.nb,parameters={"R":self.R,"L":self.L,"alpha":self.alpha,
+                                                     **self.build_options},
                      build_times=self.build_times)
 
     def set_query_arguments(self,args):

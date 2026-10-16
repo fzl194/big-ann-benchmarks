@@ -21,6 +21,9 @@ class EncodingTests(unittest.TestCase):
             for value in (-1, 2147483648):
                 with self.assertRaises(ValueError):
                     Gsvector("euclidean", {"compact_max_rows": value})
+            for name in ("build_beam_first", "build_neighbor_codes"):
+                with self.assertRaises(ValueError):
+                    Gsvector("euclidean", {name: "on"})
             adapter = Gsvector("euclidean", {"compact_max_rows": 500000})
             try:
                 self.assertEqual(adapter.compact_max_rows, 500000)
@@ -69,6 +72,7 @@ class PostgreSQLTests(unittest.TestCase):
         vectors = rng.normal(size=(160, 16)).astype("float32")
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
             "GSVECTOR_ARTIFACTS": directory, "GSVECTOR_KEEP_SCHEMA": "0",
+            "GSVECTOR_SAVE_CHECKPOINTS": "1",
         }):
             adapter = Gsvector("euclidean", {
                 "R": 16, "L": 64, "min_run_rows": 0, "batch_rows": 32,
@@ -81,6 +85,8 @@ class PostgreSQLTests(unittest.TestCase):
                 adapter.insert(vectors[:96], np.arange(96, dtype=np.uint32))
                 adapter.query(vectors[:8], 10)
                 np.testing.assert_array_equal(adapter.get_results()[:, 0], np.arange(8))
+                saved = adapter.events[-1]["checkpoint_file"]
+                np.testing.assert_array_equal(np.load(saved, allow_pickle=False), adapter.get_results())
                 connections = list(adapter._query_connections)
                 self.assertTrue(connections)
                 adapter.query(vectors[:8], 10)
