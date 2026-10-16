@@ -83,7 +83,7 @@ class Gsvector(BaseStreamingANN):
         }[metric]
         self.params = dict(index_params)
         allowed = {"R", "L", "alpha", "build_threads", "batch_rows", "compact_runs",
-                   "min_run_rows", "compaction"}
+                   "min_run_rows", "compaction", "compact_max_rows"}
         if set(self.params) - allowed:
             raise ValueError(f"unknown index parameters: {set(self.params) - allowed}")
         self.R = int(self.params.get("R", 32))
@@ -92,6 +92,9 @@ class Gsvector(BaseStreamingANN):
         self.build_threads = int(self.params.get("build_threads", 2))
         self.batch_rows = int(self.params.get("batch_rows", 32768))
         self.compact_runs = int(self.params.get("compact_runs", 8))
+        self.compact_max_rows = int(self.params.get("compact_max_rows", 0))
+        if not 0 <= self.compact_max_rows <= 2147483647:
+            raise ValueError("compact_max_rows must be in 0..2147483647")
         self.compaction = self.params.get("compaction", "full")
         if self.compaction not in ("full", "tiered"):
             raise ValueError("compaction must be full or tiered")
@@ -164,6 +167,9 @@ class Gsvector(BaseStreamingANN):
             "gsvector.merge_runs": min(self.compact_runs,1024),
         }.items():
             self.conn.execute("SELECT set_config(%s,%s,false)", (name, str(value)))
+        if "compact_max_rows" in self.params:
+            self.conn.execute("SELECT set_config('gsvector.compact_max_rows',%s,false)",
+                              (str(self.compact_max_rows),))
         self._record("setup", dimension=self.dim, max_pts=self.max_pts,
                      metric=self.metric, parameters=self.params)
 
@@ -344,7 +350,7 @@ class Gsvector(BaseStreamingANN):
 
     def _set_query_arguments(self, query_args, reset_workload):
         args = dict(query_args)
-        if set(args) - {"search_l", "threads", "random_io", "reuse_connections"}:
+        if set(args) - {"search_l", "threads", "random_io", "reuse_connections", "fed_run_pool_max"}:
             raise ValueError(f"unknown query arguments: {args}")
         for name in ("random_io", "reuse_connections"):
             if name in args and not isinstance(args[name], bool):
@@ -353,6 +359,8 @@ class Gsvector(BaseStreamingANN):
         threads = int(args.get("threads", 4))
         if search_l < 1 or threads < 1:
             raise ValueError("invalid search_l or threads")
+        if "fed_run_pool_max" in args and not 0 <= int(args["fed_run_pool_max"]) <= 1024:
+            raise ValueError("fed_run_pool_max must be in 0..1024")
         # Official runner replays the runbook for each argument group.
         if self.mutated and reset_workload:
             self._new_workload()
@@ -363,6 +371,8 @@ class Gsvector(BaseStreamingANN):
         for name in ("random_io", "reuse_connections"):
             if name in args:
                 self.query_args[name] = args[name]
+        if "fed_run_pool_max" in args:
+            self.query_args["fed_run_pool_max"] = int(args["fed_run_pool_max"])
 
     def _apply_random_io(self, conn):
         # Omitted option inherits the connection default (including PGOPTIONS).
@@ -376,6 +386,14 @@ class Gsvector(BaseStreamingANN):
             conn.execute("RESET gsvector.query_random_io")
         if conn is self.conn:
             self._single_random_io_overridden = "random_io" in self.query_args
+        if "fed_run_pool_max" in self.query_args:
+            conn.execute("SELECT set_config('gsvector.fed_run_pool_max',%s,false)",
+                         (str(self.query_args["fed_run_pool_max"]),))
+        elif ((conn is self.conn and getattr(self, "_single_pool_max_overridden", False)) or
+              (conn is not self.conn and self.query_args.get("reuse_connections", False))):
+            conn.execute("RESET gsvector.fed_run_pool_max")
+        if conn is self.conn:
+            self._single_pool_max_overridden = "fed_run_pool_max" in self.query_args
 
     def _query_chunk(self, queries, k):
         with self._query_connection() as conn:

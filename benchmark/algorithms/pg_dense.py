@@ -127,7 +127,8 @@ class PGDenseANN(Gsvector):
                 raise ValueError("invalid single query dimension/k")
             encoded = encode_vector(X)
             statement = f"SELECT id FROM base ORDER BY embedding {self.operator} %s LIMIT %s"
-            state = (self.schema,self.query_args["search_l"],k,self.query_args.get("random_io"))
+            state = (self.schema,self.query_args["search_l"],k,self.query_args.get("random_io"),
+                     self.query_args.get("fed_run_pool_max"))
             if getattr(self,"_single_state",None) != state:
                 class VectorDumper(Dumper):
                     oid = self.vector_oid

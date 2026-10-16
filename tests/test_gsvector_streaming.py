@@ -13,6 +13,25 @@ from neurips23.streaming.gsvector.module import (
 
 
 class EncodingTests(unittest.TestCase):
+    def test_bounded_maintenance_and_pool_parameter_validation(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
+            "GSVECTOR_PG_DSN": "dbname=not_connected",
+            "GSVECTOR_ARTIFACTS": directory,
+        }):
+            for value in (-1, 2147483648):
+                with self.assertRaises(ValueError):
+                    Gsvector("euclidean", {"compact_max_rows": value})
+            adapter = Gsvector("euclidean", {"compact_max_rows": 500000})
+            try:
+                self.assertEqual(adapter.compact_max_rows, 500000)
+                for value in (-1, 1025):
+                    with self.assertRaises(ValueError):
+                        adapter.set_query_arguments({"fed_run_pool_max": value})
+                adapter.set_query_arguments({"fed_run_pool_max": 64})
+                self.assertEqual(adapter.query_args["fed_run_pool_max"], 64)
+            finally:
+                adapter.done()
+
     def test_binary_copy_layout(self):
         vectors = np.array([[1.25, -2, 3, 4], [5, 6, 7, 8]], dtype=np.float32)
         ids = np.array([0, 2147483647], dtype=np.int64)
@@ -79,14 +98,19 @@ class PostgreSQLTests(unittest.TestCase):
                 np.testing.assert_array_equal(adapter.get_results()[:, 0], np.arange(8))
                 # Change session settings without replaying the workload.
                 adapter._set_query_arguments({"search_l": 100, "threads": 2,
-                    "reuse_connections": True, "random_io": True}, reset_workload=False)
+                    "reuse_connections": True, "random_io": True, "fed_run_pool_max": 32}, reset_workload=False)
                 adapter.query(vectors[:8], 10)
+                for connection in connections:
+                    self.assertEqual(connection.execute(
+                        "SHOW gsvector.fed_run_pool_max").fetchone()[0], "32")
                 adapter._set_query_arguments({"search_l": 100, "threads": 2,
                     "reuse_connections": True}, reset_workload=False)
                 adapter.query(vectors[:8], 10)
                 for connection in connections:
                     self.assertEqual(connection.execute(
                         "SHOW gsvector.query_random_io").fetchone()[0], "off")
+                    self.assertEqual(connection.execute(
+                        "SHOW gsvector.fed_run_pool_max").fetchone()[0], "8")
                 adapter.set_query_arguments({"search_l": 100, "threads": 1})
                 self.assertTrue(all(connection.closed for connection in connections))
                 self.assertEqual(adapter.live_count, 0)
