@@ -69,7 +69,9 @@ class PGDenseANN(Gsvector):
         self.R=int(options.get("r",self.R))
         self.L=int(options.get("l",self.L))
         self.alpha=float(options.get("alpha",self.alpha))
-        self._record("attach",dimension=self.dim,metric=self.metric,rows=self.live_count)
+        self.pq_m=int(options.get("pq_m",0))
+        self._record("attach",dimension=self.dim,metric=self.metric,rows=self.live_count,
+                     pq_m=self.pq_m)
 
     def fit(self, dataset):
         started = time.perf_counter()

@@ -3,7 +3,7 @@ import os
 import struct
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
 import numpy as np
 
@@ -13,6 +13,32 @@ from neurips23.streaming.gsvector.module import (
 
 
 class EncodingTests(unittest.TestCase):
+    def test_pq_subspace_validation_and_default_sql(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
+            "GSVECTOR_PG_DSN": "dbname=not_connected", "GSVECTOR_ARTIFACTS": directory,
+        }):
+            for value in (-1, 65529, True, 1.5, "25"):
+                with self.assertRaisesRegex(ValueError, "pq_m"):
+                    Gsvector("euclidean", {"pq_m": value})
+            for m in (0, 25, 3):
+                adapter = Gsvector("euclidean", {"pq_m": m})
+                adapter.dim = 100
+                adapter.conn = MagicMock()
+                try:
+                    if m == 3:
+                        with self.assertRaisesRegex(ValueError, "divide"):
+                            adapter._build_index()
+                        adapter.conn.execute.assert_not_called()
+                    else:
+                        adapter._build_index()
+                        text = adapter.conn.execute.call_args_list[0].args[0].as_string()
+                        if m:
+                            self.assertIn("pq_m=25", text)
+                        else:
+                            self.assertNotIn("pq_m", text)
+                finally:
+                    adapter.done()
+
     def test_bounded_maintenance_and_pool_parameter_validation(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
             "GSVECTOR_PG_DSN": "dbname=not_connected",
@@ -67,6 +93,36 @@ class EncodingTests(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get("GSVECTOR_PG_DSN"), "requires dedicated test PostgreSQL")
 class PostgreSQLTests(unittest.TestCase):
+    def test_explicit_pq_subspaces_survive_mutation_and_attach(self):
+        from benchmark.algorithms.pg_dense import PGDenseANN
+        vectors = np.random.default_rng(125).normal(size=(128, 100)).astype("float32")
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
+            "GSVECTOR_ARTIFACTS": directory, "GSVECTOR_KEEP_SCHEMA": "0",
+        }):
+            adapter = Gsvector("euclidean", {"R": 16, "L": 64, "pq_m": 25,
+                "min_run_rows": 0, "build_threads": 2, "batch_rows": 32, "compact_runs": 2})
+            try:
+                adapter.setup("float32", 128, 100)
+                adapter.insert(vectors[:96], np.arange(96, dtype=np.uint32))
+                adapter.insert(vectors[96:], np.arange(96, 128, dtype=np.uint32))
+                options = adapter.conn.execute(
+                    "SELECT reloptions FROM pg_class WHERE oid=%s::regclass",
+                    (adapter.schema+".ann_idx",)).fetchone()[0]
+                self.assertIn("pq_m=25", options)
+                adapter.query(vectors[[1, 100]], 10)
+                np.testing.assert_array_equal(adapter.get_results()[:, 0], [1, 100])
+                reused = PGDenseANN("euclidean", {})
+                try:
+                    reused.attach(adapter.schema)
+                    self.assertEqual(reused.pq_m, 25)
+                    reused.set_query_arguments({"search_l": 200, "threads": 1})
+                    np.testing.assert_array_equal(reused.query(vectors[[1, 100]], 10)[:, 0],
+                                                  [1, 100])
+                finally:
+                    reused.done()
+            finally:
+                adapter.done()
+
     def test_reused_connections_follow_mutations_and_close_on_reset(self):
         rng = np.random.default_rng(20261015)
         vectors = rng.normal(size=(160, 16)).astype("float32")

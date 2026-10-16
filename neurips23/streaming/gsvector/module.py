@@ -84,12 +84,15 @@ class Gsvector(BaseStreamingANN):
         self.params = dict(index_params)
         allowed = {"R", "L", "alpha", "build_threads", "batch_rows", "compact_runs",
                    "min_run_rows", "compaction", "compact_max_rows", "build_beam_first",
-                   "build_neighbor_codes"}
+                   "build_neighbor_codes", "pq_m"}
         if set(self.params) - allowed:
             raise ValueError(f"unknown index parameters: {set(self.params) - allowed}")
         self.R = int(self.params.get("R", 32))
         self.L = int(self.params.get("L", 100))
         self.alpha = float(self.params.get("alpha", 1.2))
+        self.pq_m = self.params.get("pq_m", 0)
+        if isinstance(self.pq_m, bool) or not isinstance(self.pq_m, int) or not 0 <= self.pq_m <= 65528:
+            raise ValueError("pq_m must be an integer in 0..65528")
         self.build_threads = int(self.params.get("build_threads", 2))
         self.build_beam_first = self.params.get("build_beam_first", False)
         if not isinstance(self.build_beam_first, bool):
@@ -250,11 +253,16 @@ class Gsvector(BaseStreamingANN):
                 copy.write(block)
 
     def _build_index(self):
+        if self.pq_m and (self.dim <= 0 or self.dim % self.pq_m):
+            raise ValueError("pq_m must divide the indexed dimension")
+        # Keep the default SQL compatible with installations predating pq_m.
+        pq_option = (sql.SQL(", pq_m={}").format(sql.Literal(self.pq_m))
+                     if self.pq_m else sql.SQL(""))
         self.conn.execute(sql.SQL(
             "CREATE INDEX ann_idx ON base USING gsvector (embedding {}) "
-            "WITH (engine='diskann', r={}, l={}, alpha={})"
+            "WITH (engine='diskann', r={}, l={}, alpha={}{})"
         ).format(sql.Identifier(self.opclass), sql.Literal(self.R),
-                 sql.Literal(self.L), sql.Literal(self.alpha)))
+                 sql.Literal(self.L), sql.Literal(self.alpha), pq_option))
         self.index_ready = True
         self.conn.execute("ANALYZE base")
 
