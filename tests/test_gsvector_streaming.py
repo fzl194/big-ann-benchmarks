@@ -94,6 +94,50 @@ class EncodingTests(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get("GSVECTOR_PG_DSN"), "requires dedicated test PostgreSQL")
 class PostgreSQLTests(unittest.TestCase):
+    def test_fraction_reclamation_threshold_and_absolute_floor(self):
+        for rows, fraction, absolute, threshold in ((64, .2, 1, 13),
+                                                     (64, .2, 20, 20),
+                                                     (100, .07, 1, 7)):
+            with self.subTest(rows=rows, fraction=fraction, absolute=absolute), \
+                 tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
+                     "GSVECTOR_ARTIFACTS": directory, "GSVECTOR_KEEP_SCHEMA": "0"}):
+                vectors = np.random.default_rng(20261017).normal(size=(rows, 32)).astype("float32")
+                adapter = Gsvector("euclidean", {
+                    "R": 8, "L": 32, "min_run_rows": 0, "batch_rows": rows,
+                    "build_threads": 1, "compact_runs": 4, "compaction": "tiered",
+                    "compact_max_rows": rows, "reclaim_max_rows": rows, "reclaim_cooldown": 3,
+                    "reclaim_min_dead": absolute, "reclaim_min_dead_fraction": fraction,
+                })
+                try:
+                    adapter.setup("float32", rows * 2, 32)
+                    adapter.insert(vectors, np.arange(rows, dtype=np.uint32))
+                    original = adapter._runs()
+                    # One row below the effective threshold: scan, but no rebuild.
+                    adapter.delete(np.arange(1, threshold, dtype=np.uint32))
+                    self.assertEqual(adapter._runs(), original)
+                    event = [e for e in adapter.events if e["operation"] == "maintenance_reclaim"][-1]
+                    self.assertEqual(event["outcomes"][0]["min_reclaimable_rows"], threshold)
+                    self.assertEqual(event["outcomes"][0]["outcome"], "insufficient_reclaimable")
+                    self.assertEqual(adapter.maintenance_totals["reclaim_calls"], 1)
+                    # Exactly the threshold: wait out the unchanged cooldown.
+                    adapter.delete(np.array([threshold], dtype=np.uint32))
+                    self.assertEqual(adapter.maintenance_totals["reclaim_calls"], 1)
+                    adapter._maintenance()
+                    self.assertEqual(adapter.maintenance_totals["reclaim_calls"], 1)
+                    adapter._maintenance()
+                    self.assertEqual(adapter.maintenance_totals["reclaim_calls"], 2)
+                    self.assertEqual(sum(r[1] for r in adapter._runs()), rows - threshold)
+                    event = [e for e in adapter.events if e["operation"] == "maintenance_reclaim"][-1]
+                    self.assertEqual(event["outcomes"][0]["outcome"], "reclaimed")
+                    self.assertEqual(event["outcomes"][0]["min_reclaimable_rows"], threshold)
+                    active = np.r_[0, np.arange(threshold + 1, rows)]
+                    adapter.query(vectors[active[:8]], 8)
+                    result = adapter.get_results()
+                    np.testing.assert_array_equal(result[:, 0], active[:8])
+                    self.assertTrue(np.isin(result, active).all())
+                finally:
+                    adapter.done()
+
     def test_opt_in_single_run_reclamation_and_default_compatibility(self):
         vectors = np.random.default_rng(20261017).normal(size=(64, 32)).astype("float32")
         for budget in (0, 63, 64):

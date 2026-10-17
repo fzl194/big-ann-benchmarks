@@ -23,7 +23,7 @@ from psycopg.pq import Format
 import psutil
 
 from neurips23.streaming.base import BaseStreamingANN
-from neurips23.streaming.gsvector.maintenance import ReclaimPlanner
+from neurips23.streaming.gsvector.maintenance import ReclaimPlanner, ReclaimThreshold
 
 
 class VectorBytes(bytes):
@@ -86,7 +86,8 @@ class Gsvector(BaseStreamingANN):
         allowed = {"R", "L", "alpha", "build_threads", "batch_rows", "compact_runs",
                    "min_run_rows", "compaction", "compact_max_rows", "build_beam_first",
                    "build_neighbor_codes", "pq_m", "reclaim_max_rows",
-                   "reclaim_max_runs", "reclaim_cooldown", "reclaim_min_dead"}
+                   "reclaim_max_runs", "reclaim_cooldown", "reclaim_min_dead",
+                   "reclaim_min_dead_fraction"}
         if set(self.params) - allowed:
             raise ValueError(f"unknown index parameters: {set(self.params) - allowed}")
         self.R = int(self.params.get("R", 32))
@@ -119,6 +120,9 @@ class Gsvector(BaseStreamingANN):
             if type(value) is not int or not lower <= value <= upper:
                 raise ValueError(f"{name} must be an integer in {lower}..{upper}")
             setattr(self, name, value)
+        self.reclaim_min_dead_fraction = self.params.get("reclaim_min_dead_fraction", 0)
+        self.reclaim_threshold = ReclaimThreshold(
+            self.reclaim_min_dead, self.reclaim_min_dead_fraction)
         if self.reclaim_max_rows and self.compaction != "tiered":
             raise ValueError("explicit reclamation requires compaction=tiered; no full fallback")
         self.reclaim_planner = (ReclaimPlanner(self.reclaim_max_rows, self.reclaim_max_runs,
@@ -351,9 +355,10 @@ class Gsvector(BaseStreamingANN):
             jobs, oversized = self.reclaim_planner.plan(after, fresh_ids)
             outcomes = []
             for run_id, rows in jobs:
+                minimum = self.reclaim_threshold.minimum(rows)
                 result = execute(
                     "reclaim", "SELECT gsvector_reclaim_run(%s::regclass,%s,%s,%s)",
-                    (index, run_id, rows, self.reclaim_min_dead)).fetchone()[0]
+                    (index, run_id, rows, minimum)).fetchone()[0]
                 if (not isinstance(result, dict) or
                         result.get("outcome") not in {
                             "target_missing", "input_budget", "insufficient_reclaimable",
@@ -366,7 +371,8 @@ class Gsvector(BaseStreamingANN):
                     raise ValueError("reclamation receipt/outcome disagreement")
                 if result["outcome"] == "reclaimed":
                     self.reclaim_planner.defer(receipt)
-                outcomes.append({"target_run_id": run_id, "planned_input_rows": rows, **result})
+                outcomes.append({"target_run_id": run_id, "planned_input_rows": rows,
+                                 **result, "min_reclaimable_rows": minimum})
             self._record("maintenance_reclaim", round=self.reclaim_planner.tick,
                          planned_input_rows=sum(n for _, n in jobs),
                          outcomes=outcomes, oversized_runs=oversized)

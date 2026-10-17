@@ -1,5 +1,30 @@
 """Bounded caller-side scheduling; not an estimate of reclaimability or speed."""
 
+from fractions import Fraction
+import math
+
+
+class ReclaimThreshold:
+    """Require both an absolute floor and a fraction of planned input rows."""
+
+    def __init__(self, min_dead=1, min_dead_fraction=0):
+        if type(min_dead) is not int or not 1 <= min_dead <= 2147483647:
+            raise ValueError("reclaim_min_dead must be an integer in 1..2147483647")
+        if (type(min_dead_fraction) not in (int, float) or
+                not 0 <= min_dead_fraction <= 1 or not math.isfinite(min_dead_fraction)):
+            raise ValueError("reclaim_min_dead_fraction must be a finite number in 0..1")
+        self.min_dead = min_dead
+        # Interpret the configured decimal, not the float's binary expansion:
+        # e.g. ceil(0.07 * 100) must be 7, not 8 from floating multiplication.
+        self.fraction = Fraction(str(min_dead_fraction))
+
+    def minimum(self, rows):
+        if type(rows) is not int or not 1 <= rows <= 2147483647:
+            raise ValueError("reclaim input rows must be an integer in 1..2147483647")
+        numerator = rows * self.fraction.numerator
+        proportional = (numerator + self.fraction.denominator - 1) // self.fraction.denominator
+        return max(self.min_dead, proportional)
+
 
 class ReclaimPlanner:
     def __init__(self, max_rows, max_runs=1, cooldown=8):

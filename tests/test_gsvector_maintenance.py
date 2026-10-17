@@ -4,8 +4,35 @@ import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
-from neurips23.streaming.gsvector.maintenance import ReclaimPlanner
+from neurips23.streaming.gsvector.maintenance import ReclaimPlanner, ReclaimThreshold
 from neurips23.streaming.gsvector.module import Gsvector
+
+
+class ThresholdTests(unittest.TestCase):
+    def test_default_and_absolute_floor(self):
+        self.assertEqual(ReclaimThreshold().minimum(2147483647), 1)
+        self.assertEqual(ReclaimThreshold(20, .2).minimum(64), 20)
+        self.assertEqual(ReclaimThreshold(100, 1).minimum(64), 100)
+
+    def test_decimal_ceiling_and_boundaries(self):
+        for fraction, rows, expected in ((.2, 64, 13), (.2, 65, 13), (.2, 66, 14),
+                                         (.07, 100, 7), (.07, 101, 8),
+                                         (1, 2147483647, 2147483647),
+                                         (.2, 2147483647, 429496730),
+                                         (1e-20, 2147483647, 1)):
+            with self.subTest(fraction=fraction, rows=rows):
+                self.assertEqual(ReclaimThreshold(1, fraction).minimum(rows), expected)
+
+    def test_invalid_values(self):
+        for value in (-.1, 1.01, True, "0.2", None, float("nan"),
+                      float("inf"), -float("inf"), 10**400):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                ReclaimThreshold(1, value)
+        for value in (0, -1, True, 1.5, 2147483648):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                ReclaimThreshold(value)
+            with self.subTest(rows=value), self.assertRaises(ValueError):
+                ReclaimThreshold().minimum(value)
 
 
 class PlannerTests(unittest.TestCase):
@@ -66,10 +93,10 @@ class AdapterWiringTests(unittest.TestCase):
         self.env.stop()
         self.tmp.cleanup()
 
-    def adapter(self, enabled=True):
+    def adapter(self, enabled=True, **params):
         adapter = Gsvector("euclidean", {"compaction": "tiered", "compact_runs": 4,
                                          "reclaim_max_rows": 64 if enabled else 0,
-                                         "reclaim_cooldown": 3})
+                                         "reclaim_cooldown": 3, **params})
         self.addCleanup(adapter.done)
         adapter.conn = MagicMock()
         adapter.schema = "test_reclaim"
@@ -106,6 +133,20 @@ class AdapterWiringTests(unittest.TestCase):
         self.assertEqual(len(self.reclaim_calls(adapter)), 1)
         adapter._maintenance()
         self.assertEqual(len(self.reclaim_calls(adapter)), 2)
+
+    def test_fraction_threshold_is_passed_and_recorded(self):
+        for absolute, expected in ((1, 13), (20, 20)):
+            adapter = self.adapter(reclaim_min_dead_fraction=.2, reclaim_min_dead=absolute)
+            adapter._reclaim_dirty = True
+            adapter._maintenance()
+            self.assertEqual(self.reclaim_calls(adapter)[0].args[1],
+                             ("test_reclaim.ann_idx", 1, 64, expected))
+            outcome = adapter._record.call_args.kwargs["outcomes"][0]
+            self.assertEqual(outcome["min_reclaimable_rows"], expected)
+            self.assertEqual(outcome["outcome"], "insufficient_reclaimable")
+            self.assertEqual(adapter.maintenance_totals["reclaim_calls"], 1)
+            adapter._maintenance()
+            self.assertEqual(len(self.reclaim_calls(adapter)), 1)
 
     def test_error_propagation_and_oversized_reporting(self):
         adapter = self.adapter()
@@ -155,7 +196,10 @@ class AdapterWiringTests(unittest.TestCase):
     def test_new_parameter_validation(self):
         for args in ({"reclaim_max_rows": 64}, {"reclaim_max_rows": True},
                      {"reclaim_min_dead": 0}, {"reclaim_max_runs": "1"},
-                     {"reclaim_cooldown": 0}, {"reclaim_max_rows": -1}):
+                     {"reclaim_cooldown": 0}, {"reclaim_max_rows": -1},
+                     {"reclaim_min_dead_fraction": True},
+                     {"reclaim_min_dead_fraction": float("nan")},
+                     {"reclaim_min_dead_fraction": "0.2"}):
             with self.subTest(args=args), self.assertRaises(ValueError):
                 Gsvector("euclidean", args)
 
