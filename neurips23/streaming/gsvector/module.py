@@ -23,6 +23,7 @@ from psycopg.pq import Format
 import psutil
 
 from neurips23.streaming.base import BaseStreamingANN
+from neurips23.streaming.gsvector.maintenance import ReclaimPlanner
 
 
 class VectorBytes(bytes):
@@ -84,7 +85,8 @@ class Gsvector(BaseStreamingANN):
         self.params = dict(index_params)
         allowed = {"R", "L", "alpha", "build_threads", "batch_rows", "compact_runs",
                    "min_run_rows", "compaction", "compact_max_rows", "build_beam_first",
-                   "build_neighbor_codes", "pq_m"}
+                   "build_neighbor_codes", "pq_m", "reclaim_max_rows",
+                   "reclaim_max_runs", "reclaim_cooldown", "reclaim_min_dead"}
         if set(self.params) - allowed:
             raise ValueError(f"unknown index parameters: {set(self.params) - allowed}")
         self.R = int(self.params.get("R", 32))
@@ -108,6 +110,21 @@ class Gsvector(BaseStreamingANN):
         self.compaction = self.params.get("compaction", "full")
         if self.compaction not in ("full", "tiered"):
             raise ValueError("compaction must be full or tiered")
+        reclaim_defaults = {"reclaim_max_rows": 0, "reclaim_max_runs": 1,
+                            "reclaim_cooldown": 8, "reclaim_min_dead": 1}
+        for name, default in reclaim_defaults.items():
+            value = self.params.get(name, default)
+            upper = {"reclaim_max_runs": 256, "reclaim_cooldown": 1000000}.get(name, 2147483647)
+            lower = 0 if name == "reclaim_max_rows" else 1
+            if type(value) is not int or not lower <= value <= upper:
+                raise ValueError(f"{name} must be an integer in {lower}..{upper}")
+            setattr(self, name, value)
+        if self.reclaim_max_rows and self.compaction != "tiered":
+            raise ValueError("explicit reclamation requires compaction=tiered; no full fallback")
+        self.reclaim_planner = (ReclaimPlanner(self.reclaim_max_rows, self.reclaim_max_runs,
+                                             self.reclaim_cooldown)
+                                if self.reclaim_max_rows else None)
+        self._reclaim_dirty = False
         self.min_run_rows = int(self.params.get("min_run_rows", 32768))
         if not (1 <= self.R <= self.L <= 4096 and 1 <= self.alpha <= 4):
             raise ValueError("invalid R/L/alpha")
@@ -149,6 +166,12 @@ class Gsvector(BaseStreamingANN):
             raise ValueError("max_pts must be positive")
         self.conn = psycopg.connect(self.dsn, autocommit=True)
         self.conn.execute("CREATE EXTENSION IF NOT EXISTS gsvector")
+        if self.reclaim_planner is not None and not self.conn.execute(
+                "SELECT to_regprocedure('gsvector_reclaim_run(regclass,bigint,integer,integer)')"
+                " IS NOT NULL").fetchone()[0]:
+            self.conn.close()
+            self.conn = None
+            raise ValueError("reclamation requires gsvector 0.1.8 API; upgrade explicitly")
         self.vector_oid = self.conn.execute("SELECT 'vector'::regtype::oid").fetchone()[0]
         # A separate private schema per workload, including each query-arg sweep.
         self._new_workload()
@@ -162,6 +185,9 @@ class Gsvector(BaseStreamingANN):
         self.mutated = False
         self.live_count = 0
         self.index_ready = False
+        self._reclaim_dirty = False
+        if self.reclaim_planner is not None:
+            self.reclaim_planner.reset()
         self.conn.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(self.schema)))
         self.schemas.append(self.schema)
         self.conn.execute(sql.SQL("SET search_path TO {}, public").format(sql.Identifier(self.schema)))
@@ -315,6 +341,35 @@ class Gsvector(BaseStreamingANN):
                     if not execute("compact", "SELECT gsvector_compact(%s::regclass,false)",
                                    (index,)).fetchone()[0]:
                         break
+        # Independent of the merge-run count gate. A successful delete/update
+        # latches potential debt; cooldown permits retries after old snapshots
+        # release even when no further deletes arrive. Inserts alone do not
+        # activate scans on an otherwise clean workload.
+        if self.reclaim_planner is not None and self._reclaim_dirty:
+            after = self._runs()
+            fresh_ids = {int(r[0]) for r in after} - {int(r[0]) for r in runs}
+            jobs, oversized = self.reclaim_planner.plan(after, fresh_ids)
+            outcomes = []
+            for run_id, rows in jobs:
+                result = execute(
+                    "reclaim", "SELECT gsvector_reclaim_run(%s::regclass,%s,%s,%s)",
+                    (index, run_id, rows, self.reclaim_min_dead)).fetchone()[0]
+                if (not isinstance(result, dict) or
+                        result.get("outcome") not in {
+                            "target_missing", "input_budget", "insufficient_reclaimable",
+                            "reclaimed", "retired"}):
+                    raise ValueError("unexpected reclamation result")
+                receipt = result.get("receipt")
+                if type(receipt) is not int or receipt < 0:
+                    raise ValueError("invalid reclamation receipt")
+                if (result["outcome"] in {"reclaimed", "retired"}) != (receipt > 0):
+                    raise ValueError("reclamation receipt/outcome disagreement")
+                if result["outcome"] == "reclaimed":
+                    self.reclaim_planner.defer(receipt)
+                outcomes.append({"target_run_id": run_id, "planned_input_rows": rows, **result})
+            self._record("maintenance_reclaim", round=self.reclaim_planner.tick,
+                         planned_input_rows=sum(n for _, n in jobs),
+                         outcomes=outcomes, oversized_runs=oversized)
 
     def insert(self, X, ids):
         start = time.perf_counter()
@@ -345,6 +400,8 @@ class Gsvector(BaseStreamingANN):
                 if deleted != len(batch):
                     raise ValueError("delete contains inactive IDs")
             self.live_count -= deleted
+            if deleted:
+                self._reclaim_dirty = True
         self._maintenance()
         self.mutated = True
         self._record("delete", rows=len(ids), elapsed_s=time.perf_counter() - start, runs=self._runs())
@@ -362,6 +419,7 @@ class Gsvector(BaseStreamingANN):
                 ).rowcount
                 if replaced != end - offset:
                     raise ValueError("replace contains inactive IDs")
+            self._reclaim_dirty = True
             self._maintenance()
         self.mutated = True
         self._record("replace", rows=len(ids), elapsed_s=time.perf_counter() - start, runs=self._runs())

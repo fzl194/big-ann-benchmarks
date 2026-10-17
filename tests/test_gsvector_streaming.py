@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import patch, MagicMock
 
 import numpy as np
+import psycopg
 
 from neurips23.streaming.gsvector.module import (
     Gsvector, binary_copy_blocks, encode_vector, has_index_plan,
@@ -93,6 +94,78 @@ class EncodingTests(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get("GSVECTOR_PG_DSN"), "requires dedicated test PostgreSQL")
 class PostgreSQLTests(unittest.TestCase):
+    def test_opt_in_single_run_reclamation_and_default_compatibility(self):
+        vectors = np.random.default_rng(20261017).normal(size=(64, 32)).astype("float32")
+        for budget in (0, 63, 64):
+            with self.subTest(budget=budget), tempfile.TemporaryDirectory() as directory, \
+                 patch.dict(os.environ, {"GSVECTOR_ARTIFACTS": directory, "GSVECTOR_KEEP_SCHEMA": "0"}):
+                adapter = Gsvector("euclidean", {
+                    "R": 8, "L": 32, "min_run_rows": 0, "batch_rows": 64,
+                    "build_threads": 1, "compact_runs": 4, "compaction": "tiered",
+                    "compact_max_rows": 64, "reclaim_max_rows": budget,
+                    "reclaim_cooldown": 3,
+                })
+                try:
+                    adapter.setup("float32", 128, 32)
+                    adapter.insert(vectors, np.arange(64, dtype=np.uint32))
+                    self.assertNotIn("reclaim_calls", adapter.maintenance_totals)
+                    adapter.delete(np.arange(8, 64, dtype=np.uint32))
+                    self.assertEqual(sum(r[1] for r in adapter._runs()), 8 if budget == 64 else 64)
+                    adapter.query(vectors[:8], 8)
+                    np.testing.assert_array_equal(adapter.get_results()[:, 0], np.arange(8))
+                    self.assertTrue(np.all(adapter.get_results() < 8))
+                    if budget == 64:
+                        self.assertEqual(adapter.maintenance_totals["reclaim_calls"], 1)
+                        for _ in range(2):
+                            adapter._maintenance()
+                        self.assertEqual(adapter.maintenance_totals["reclaim_calls"], 1)
+                        adapter._maintenance()
+                        self.assertEqual(adapter.maintenance_totals["reclaim_calls"], 2)
+                        self.assertEqual(adapter.events[-1]["outcomes"][0]["outcome"],
+                                         "insufficient_reclaimable")
+                        adapter.set_query_arguments({"search_l": 100, "threads": 1})
+                        self.assertFalse(adapter._reclaim_dirty)
+                        self.assertEqual(adapter.reclaim_planner.tick, 0)
+                        self.assertEqual(adapter.reclaim_planner.due, {})
+                    elif budget:
+                        event = [e for e in adapter.events if e["operation"] == "maintenance_reclaim"][-1]
+                        self.assertEqual(event["planned_input_rows"], 0)
+                        self.assertEqual(len(event["oversized_runs"]), 1)
+                        self.assertNotIn("reclaim_calls", adapter.maintenance_totals)
+                    else:
+                        self.assertFalse(any(e["operation"] == "maintenance_reclaim" for e in adapter.events))
+                finally:
+                    adapter.done()
+
+    def test_reclamation_retries_after_old_snapshot_release_without_new_delete(self):
+        vectors = np.random.default_rng(20261018).normal(size=(64, 32)).astype("float32")
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
+                "GSVECTOR_ARTIFACTS": directory, "GSVECTOR_KEEP_SCHEMA": "0"}):
+            adapter = Gsvector("euclidean", {
+                "R": 8, "L": 32, "min_run_rows": 0, "batch_rows": 64,
+                "build_threads": 1, "compact_runs": 4, "compaction": "tiered",
+                "compact_max_rows": 64, "reclaim_max_rows": 64, "reclaim_cooldown": 3,
+            })
+            try:
+                adapter.setup("float32", 128, 32)
+                adapter.insert(vectors, np.arange(64, dtype=np.uint32))
+                with psycopg.connect(adapter.dsn, autocommit=True) as old:
+                    old.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+                    self.assertEqual(old.execute(
+                        f'SELECT count(*) FROM "{adapter.schema}".base').fetchone()[0], 64)
+                    adapter.delete(np.arange(8, 64, dtype=np.uint32))
+                    self.assertEqual(sum(r[1] for r in adapter._runs()), 64)
+                    event = [e for e in adapter.events if e["operation"] == "maintenance_reclaim"][-1]
+                    self.assertEqual(event["outcomes"][0]["outcome"], "insufficient_reclaimable")
+                    old.execute("ROLLBACK")
+                for _ in range(3):
+                    adapter._maintenance()
+                self.assertEqual(sum(r[1] for r in adapter._runs()), 8)
+                adapter.query(vectors[:8], 8)
+                np.testing.assert_array_equal(adapter.get_results()[:, 0], np.arange(8))
+            finally:
+                adapter.done()
+
     def test_explicit_pq_subspaces_survive_mutation_and_attach(self):
         from benchmark.algorithms.pg_dense import PGDenseANN
         vectors = np.random.default_rng(125).normal(size=(128, 100)).astype("float32")
