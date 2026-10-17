@@ -102,6 +102,18 @@ msturing-30M-clustered:
           "reclaim_min_dead": 10000, "reclaim_min_dead_fraction": 0.2}]'
         query-args: '[{"search_l": 200, "threads": 32, "reuse_connections": true, "fed_run_pool_max":
           64}]'
+  gsvector-resource-cachewide:
+    docker-tag: neurips23-streaming-gsvector
+    module: neurips23.streaming.gsvector.module
+    constructor: Gsvector
+    base-args:
+    - '@metric'
+    run-groups:
+      resource-diagnostic:
+        args: '[{"R": 24, "L": 64, "build_threads": 32, "batch_rows": 1000000, "compact_runs":
+          4, "min_run_rows": 0, "compaction": "tiered", "compact_max_rows": 500000}]'
+        query-args: '[{"search_l": 200, "threads": 32, "reuse_connections": true, "fed_run_pool_max":
+          256}]'
 random-xs:
   gsvector:
     docker-tag: neurips23-streaming-gsvector
@@ -152,3 +164,15 @@ msturing-60k-streaming:
           "reclaim_min_dead": 10000, "reclaim_min_dead_fraction": 0.2}]'
         query-args: '[{"search_l": 200, "threads": 32, "reuse_connections": true, "fed_run_pool_max":
           64}]'
+  gsvector-resource-cachewide:
+    docker-tag: neurips23-streaming-gsvector
+    module: neurips23.streaming.gsvector.module
+    constructor: Gsvector
+    base-args:
+    - '@metric'
+    run-groups:
+      resource-diagnostic:
+        args: '[{"R": 24, "L": 64, "build_threads": 32, "batch_rows": 1000000, "compact_runs":
+          4, "min_run_rows": 0, "compaction": "tiered", "compact_max_rows": 500000}]'
+        query-args: '[{"search_l": 200, "threads": 32, "reuse_connections": true, "fed_run_pool_max":
+          256}]'
