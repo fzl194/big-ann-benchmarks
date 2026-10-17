@@ -32,3 +32,14 @@ any:
           [{"R":24,"L":64,"build_threads":4,"batch_rows":4096,"min_run_rows":0,"build_beam_first":true,"build_neighbor_codes":false}]
         query-args: |
           [{"threads":4,"search_l":200,"initial_candidates":256,"max_candidates":8192,"exact_cutoff":2048}]
+  gsvector-filter-resource-wide:
+    docker-tag: gsvector-filter-submission-pending
+    module: benchmark.algorithms.pg_filtered
+    constructor: PGFilteredANN
+    base-args:
+    - '@metric'
+    run-groups:
+      adaptive:
+        args: '[{"R": 32, "L": 100, "build_threads": 32, "batch_rows": 4096}]'
+        query-args: '[{"threads": 32, "search_l": 200, "initial_candidates": 256, "max_candidates":
+          8192, "exact_cutoff": 2048}]'
