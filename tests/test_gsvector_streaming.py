@@ -111,6 +111,10 @@ class PostgreSQLTests(unittest.TestCase):
                 try:
                     adapter.setup("float32", rows * 2, 32)
                     adapter.insert(vectors, np.arange(rows, dtype=np.uint32))
+                    # A previous R8/L32 build left ID9 with no incoming edge.
+                    # Cover initial construction too, not just post-reclaim queries.
+                    adapter.query(vectors, 8)
+                    np.testing.assert_array_equal(adapter.get_results()[:, 0], np.arange(rows))
                     original = adapter._runs()
                     # One row below the effective threshold: scan, but no rebuild.
                     adapter.delete(np.arange(1, threshold, dtype=np.uint32))
@@ -131,9 +135,9 @@ class PostgreSQLTests(unittest.TestCase):
                     self.assertEqual(event["outcomes"][0]["outcome"], "reclaimed")
                     self.assertEqual(event["outcomes"][0]["min_reclaimable_rows"], threshold)
                     active = np.r_[0, np.arange(threshold + 1, rows)]
-                    adapter.query(vectors[active[:8]], 8)
+                    adapter.query(vectors[active], 8)
                     result = adapter.get_results()
-                    np.testing.assert_array_equal(result[:, 0], active[:8])
+                    np.testing.assert_array_equal(result[:, 0], active)
                     self.assertTrue(np.isin(result, active).all())
                 finally:
                     adapter.done()
