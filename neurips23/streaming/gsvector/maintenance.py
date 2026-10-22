@@ -27,7 +27,7 @@ class ReclaimThreshold:
 
 
 class ReclaimPlanner:
-    def __init__(self, max_rows, max_runs=1, cooldown=8):
+    def __init__(self, max_rows, max_runs=1, cooldown=8, backoff_max=0):
         for name, value, upper in (("max_rows", max_rows, 2147483647),
                                    ("max_runs", max_runs, 256),
                                    ("cooldown", cooldown, 1000000)):
@@ -36,11 +36,16 @@ class ReclaimPlanner:
         self.max_rows = max_rows
         self.max_runs = max_runs
         self.cooldown = cooldown
+        if (type(backoff_max) is not int or not 0 <= backoff_max <= 1000000 or
+                (backoff_max and backoff_max < cooldown)):
+            raise ValueError("backoff_max must be zero or an integer in cooldown..1000000")
+        self.backoff_max = backoff_max
         self.reset()
 
     def reset(self):
         self.tick = 0
         self.due = {}
+        self.retry_delays = {}
 
     def plan(self, runs, fresh_ids=()):
         """Charge every selected physical row, including no-op attempts.
@@ -59,6 +64,8 @@ class ReclaimPlanner:
             current[run_id] = rows
         self.tick += 1
         self.due = {run_id: due for run_id, due in self.due.items() if run_id in current}
+        self.retry_delays = {run_id: delay for run_id, delay in self.retry_delays.items()
+                             if run_id in current}
         for run_id in current:
             self.due.setdefault(run_id, self.tick)
         for run_id in fresh_ids:
@@ -82,3 +89,24 @@ class ReclaimPlanner:
 
     def defer(self, run_id):
         self.due[run_id] = self.tick + self.cooldown
+
+    def record_outcome(self, run_id, outcome):
+        """Back off no-benefit scans, never the server's MVCC safety decision.
+
+        Retrying remains bounded even without new mutations: old snapshots can
+        release after an insufficient_reclaimable result. New deletes may wait
+        up to backoff_max maintenance rounds; this is an opt-in scheduling tradeoff.
+        """
+        if outcome not in {"target_missing", "input_budget", "insufficient_reclaimable",
+                           "reclaimed", "retired"}:
+            raise ValueError("unexpected reclamation outcome")
+        if not self.backoff_max:
+            return
+        if outcome == "insufficient_reclaimable":
+            delay = min(self.backoff_max,
+                        2 * self.retry_delays.get(run_id, self.cooldown))
+            self.retry_delays[run_id] = delay
+            self.due[run_id] = self.tick + delay
+        else:
+            self.retry_delays.pop(run_id, None)
+            self.due.pop(run_id, None)

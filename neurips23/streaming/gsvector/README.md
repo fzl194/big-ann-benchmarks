@@ -63,6 +63,98 @@ silently masquerading as official full runs.
 - Query-argument sweeps start fresh workloads instead of replaying insertions
   into the previous argument group's populated index.
 
+### Experimental maintenance and query controls
+
+`release_input_cache` is an opt-in boolean index parameter (default `false`).
+After a successful mutation COPY/UPDATE commits, the adapter can advise away
+whole pages of the consumed, contiguous, **read-only numpy memmap** input slice,
+before index maintenance. It does not close the caller's map or change any file
+bytes; a later reread loads the same data again. Heap arrays, strided views,
+writable/COW maps, partial boundary pages and unsupported platforms are skipped.
+The policy uses no future operations, dataset IDs, query results or ground truth.
+
+This is drop-behind for input I/O, not an exclusion from memory accounting:
+input reads, COPY, advice and index work remain within the same timed resource
+scope. `input_cache_eligible_bytes`, `input_cache_advised_bytes`,
+`input_cache_calls`, `input_cache_errors` and `input_cache_s` are recorded in
+mutation maintenance totals. Advised bytes are **not** a measurement of freed
+RAM; validate residency and cgroup pressure separately. Advisory errors do not
+invalidate an already committed mutation. Use private benchmark inputs: file
+cache is shared with any other process reading the same inode, so drop-behind
+can slow those readers. `gsvector-streaming-retire-input-release` is the explicit
+experimental configuration; it is not a claim of full-run admission.
+
+`vacuum_memtables` is a separate opt-in boolean (default `false`). After normal
+drain/compaction/reclamation it runs PostgreSQL `VACUUM (PARALLEL 0)` on both
+internal heap slots belonging to this index. Base-table VACUUM only attempts
+explicit truncation of the non-active slot; a logically empty active slot can
+still have many physical pages, and every query scans both slots. Vacuuming the
+internal heaps can remove that repeated empty-page work. The adapter records
+`vacuum_mt_calls` and `vacuum_mt_s`, already included in mutation elapsed time.
+
+This is **not SQL TRUNCATE** and never skips a source based on estimated row
+counts. PostgreSQL retains versions required by old snapshots or in-flight
+transactions; truncation may be deferred by concurrent readers. It requires
+permission to vacuum the index's internal heaps. The combined experimental
+configuration is `gsvector-streaming-retire-input-mt`; its performance must be
+measured over both mutations and queries, not just the faster query phase.
+
+`reclaim_backoff_max` is an opt-in index parameter (default `0`, disabled).
+With explicit tiered reclamation enabled, an `insufficient_reclaimable` receipt
+doubles that run's retry interval from `reclaim_cooldown` up to this maximum,
+measured in maintenance rounds. The maximum must be at least the base cooldown
+and no greater than 1,000,000. Successful/retired runs do not transfer backoff
+history to their replacements; removed runs and new workloads discard it.
+The event receipt includes `retry_after_rounds`.
+
+This only schedules calls to the unchanged server-side MVCC-safe reclamation
+API. It never infers safety from benchmark IDs or anticipated operations.
+Retries continue without new deletes, allowing old snapshots to release.
+Conversely, new deletes can wait up to the maximum interval before a target
+is eligible again; resource contention can delay execution further. It can
+reduce futile scans but can also increase query cost or reclamation debt.
+
+`grouped_rerank` is an optional boolean query parameter forwarding the existing
+`gsvector.grouped_rerank` GUC. Omitting it inherits the connection default;
+removing an override resets it on reused connections. It changes candidate
+grouping, not search breadth. Older extension versions lacking this GUC will
+reject an explicit setting rather than silently ignore it.
+
+`gsvector-streaming-reclaim-control` and `gsvector-streaming-reclaim-backoff`
+are diagnostic 8-thread configurations differing only in `reclaim_backoff_max`.
+They do not enable grouped reranking, reduce queries, or assert 8GB/one-hour
+admission. The original configurations and default behavior remain unchanged.
+
+`federate_k` is an optional numeric query parameter in `1..8`, forwarding the
+per-source candidate multiplier (server default `1.5`). It is independent of
+`search_l`; removing an override resets the session default, including on
+reused single-query connections. Changing it can change recall and result IDs.
+
+`gsvector-streaming-retire-only` is an **experimental, not full-run-validated**
+configuration. Its extra single-run reclamation uses
+`reclaim_min_dead=1, reclaim_min_dead_fraction=1.0`, so only a wholly
+MVCC-reclaimable run may retire; a partly live run is not rebuilt by that API.
+Normal insertion/drain and tiered compaction still build graphs: "retire-only"
+does not describe all maintenance. Input budget is 1M rows per maintenance
+round, at most two runs, with bounded no-benefit backoff. Its query setting
+`federate_k=2.0` restored sampled recall in a final-state diagnostic. Removing
+dead runs can change adaptive deepening; neither the quality nor the overall
+performance is guaranteed for every checkpoint. Queries and mutation semantics
+are not shortened or anticipated.
+
+Two additional **unvalidated full-run controls**, not new defaults:
+
+- `gsvector-streaming-retire-reconnect` changes only `reuse_connections=false`.
+  Each worker still runs its entire query chunk on one connection, then closes
+  it. This is not one connection per query. It tests cross-checkpoint backend
+  and handle-cache lifetime; it is not a proven fix.
+- `gsvector-streaming-retire-codeoff` changes only `build_neighbor_codes=false`.
+  It tests the existing compact graph layout through normal construction.
+  Fixed-topology diagnostics showed lower memory/cold I/O but slower warm
+  searches, so it must not be assumed faster overall. Verify the emitted run
+  layouts too: this is a build-session GUC, not a persisted index-wide policy
+  automatically inherited by every background maintenance connection.
+
 ## Measurement boundaries
 
 The official runner's `search_times` includes each full query batch, connection

@@ -1,8 +1,11 @@
 """Offline scheduler and adapter wiring checks; no database required."""
 import os
+import json
+from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
+import yaml
 
 from neurips23.streaming.gsvector.maintenance import ReclaimPlanner, ReclaimThreshold
 from neurips23.streaming.gsvector.module import Gsvector
@@ -36,6 +39,45 @@ class ThresholdTests(unittest.TestCase):
 
 
 class PlannerTests(unittest.TestCase):
+    def test_backoff_bounded_retry_and_reset(self):
+        planner = ReclaimPlanner(64, 1, 2, backoff_max=8)
+        attempts = []
+        for _ in range(31):
+            jobs, _ = planner.plan([(1, 64)])
+            if jobs:
+                attempts.append(planner.tick)
+                planner.record_outcome(1, "insufficient_reclaimable")
+        self.assertEqual(attempts, [1, 5, 13, 21, 29])
+        self.assertEqual(planner.retry_delays, {1: 8})
+        planner.record_outcome(1, "reclaimed")
+        self.assertNotIn(1, planner.retry_delays)
+        planner.defer(2)
+        self.assertEqual(planner.plan([(2, 8)])[0], [])
+        self.assertNotIn(1, planner.due)
+        planner.reset()
+        self.assertEqual(planner.retry_delays, {})
+        self.assertEqual(planner.due, {})
+
+    def test_backoff_disabled_preserves_schedule_and_missing_runs_are_pruned(self):
+        planner = ReclaimPlanner(64, 1, 2)
+        planner.plan([(1, 64)])
+        planner.record_outcome(1, "insufficient_reclaimable")
+        self.assertEqual(planner.due, {1: 3})
+        self.assertEqual(planner.retry_delays, {})
+        enabled = ReclaimPlanner(64, 1, 2, 8)
+        enabled.plan([(1, 64)])
+        enabled.record_outcome(1, "insufficient_reclaimable")
+        enabled.plan([(2, 64)])
+        self.assertNotIn(1, enabled.retry_delays)
+        self.assertNotIn(1, enabled.due)
+        with self.assertRaises(ValueError):
+            enabled.record_outcome(2, "unknown")
+
+    def test_backoff_validation(self):
+        for value in (-1, True, 1.5, "8", 1, 1000001):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                ReclaimPlanner(64, 1, 2, value)
+
     def test_budget_count_and_oversized_reporting(self):
         planner = ReclaimPlanner(64, 2, 3)
         jobs, oversized = planner.plan([("1", 40), ("2", 40), ("3", 24), ("4", 65)])
@@ -134,6 +176,83 @@ class AdapterWiringTests(unittest.TestCase):
         adapter._maintenance()
         self.assertEqual(len(self.reclaim_calls(adapter)), 2)
 
+    def test_backoff_feedback_and_retry_telemetry(self):
+        adapter = self.adapter(reclaim_backoff_max=12)
+        adapter._reclaim_dirty = True
+        adapter._maintenance()
+        self.assertEqual(adapter._record.call_args.kwargs["outcomes"][0]["retry_after_rounds"], 6)
+        for _ in range(5):
+            adapter._maintenance()
+        self.assertEqual(len(self.reclaim_calls(adapter)), 1)
+        adapter._maintenance()
+        self.assertEqual(len(self.reclaim_calls(adapter)), 2)
+        self.assertEqual(adapter._record.call_args.kwargs["outcomes"][0]["retry_after_rounds"], 12)
+
+    def test_grouped_rerank_option_and_persistent_reset(self):
+        adapter = self.adapter()
+        for value in (1, "on", None):
+            with self.assertRaises(ValueError):
+                adapter._set_query_arguments({"grouped_rerank": value}, reset_workload=False)
+        adapter._set_query_arguments({"grouped_rerank": True}, reset_workload=False)
+        adapter._apply_random_io(adapter.conn)
+        self.assertIn(
+            (("SELECT set_config('gsvector.grouped_rerank',%s,false)", ("on",)),),
+            adapter.conn.execute.call_args_list)
+        adapter._set_query_arguments({}, reset_workload=False)
+        adapter._apply_random_io(adapter.conn)
+        adapter.conn.execute.assert_called_with("RESET gsvector.grouped_rerank")
+
+    def test_federate_budget_validation_and_reset(self):
+        adapter = self.adapter()
+        for value in (True, None, "2", 0, 8.01, float("inf"), float("nan"), 10**400):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                adapter._set_query_arguments({"federate_k": value}, reset_workload=False)
+        adapter._set_query_arguments({"federate_k": 2}, reset_workload=False)
+        adapter._apply_random_io(adapter.conn)
+        adapter.conn.execute.assert_called_with(
+            "SELECT set_config('gsvector.federate_k',%s,false)", ("2",))
+        adapter._set_query_arguments({}, reset_workload=False)
+        adapter._apply_random_io(adapter.conn)
+        adapter.conn.execute.assert_called_with("RESET gsvector.federate_k")
+
+    def test_retire_only_configuration_requires_all_rows_reclaimable(self):
+        path = (Path(__file__).resolve().parents[1] /
+                "neurips23/streaming/gsvector/config.yaml")
+        group = yaml.safe_load(path.read_text())["msturing-30M-clustered"][
+            "gsvector-streaming-retire-only"]["run-groups"]["experimental-retirement"]
+        adapter = Gsvector("euclidean", json.loads(group["args"])[0])
+        self.addCleanup(adapter.done)
+        adapter.set_query_arguments(json.loads(group["query-args"])[0])
+        for rows in (1, 64, 1000000):
+            self.assertEqual(adapter.reclaim_threshold.minimum(rows), rows)
+        self.assertEqual(adapter.reclaim_max_rows, 1000000)
+        self.assertEqual(adapter.reclaim_max_runs, 2)
+        self.assertEqual(adapter.query_args["federate_k"], 2.0)
+
+    def test_failure_diagnostic_configs_change_one_factor_only(self):
+        path = (Path(__file__).resolve().parents[1] /
+                "neurips23/streaming/gsvector/config.yaml")
+        configs = yaml.safe_load(path.read_text())["msturing-30M-clustered"]
+        def arguments(name):
+            group, = configs[name]["run-groups"].values()
+            return json.loads(group["args"])[0], json.loads(group["query-args"])[0]
+        base_index, base_query = arguments("gsvector-streaming-retire-only")
+        for name in ("gsvector-streaming-retire-reconnect", "gsvector-streaming-retire-codeoff"):
+            index, query = arguments(name)
+            adapter = Gsvector("euclidean", index)
+            self.addCleanup(adapter.done)
+            adapter.set_query_arguments(query)
+            if name.endswith("reconnect"):
+                self.assertFalse(query.pop("reuse_connections"))
+                expected = dict(base_query)
+                expected.pop("reuse_connections")
+                self.assertEqual(query, expected)
+                self.assertEqual(index, base_index)
+            else:
+                self.assertFalse(index.pop("build_neighbor_codes"))
+                self.assertEqual(index, base_index)
+                self.assertEqual(query, base_query)
+
     def test_fraction_threshold_is_passed_and_recorded(self):
         for absolute, expected in ((1, 13), (20, 20)):
             adapter = self.adapter(reclaim_min_dead_fraction=.2, reclaim_min_dead=absolute)
@@ -199,7 +318,9 @@ class AdapterWiringTests(unittest.TestCase):
                      {"reclaim_cooldown": 0}, {"reclaim_max_rows": -1},
                      {"reclaim_min_dead_fraction": True},
                      {"reclaim_min_dead_fraction": float("nan")},
-                     {"reclaim_min_dead_fraction": "0.2"}):
+                     {"reclaim_min_dead_fraction": "0.2"},
+                     {"reclaim_backoff_max": True}, {"reclaim_backoff_max": -1},
+                     {"reclaim_backoff_max": 4}):
             with self.subTest(args=args), self.assertRaises(ValueError):
                 Gsvector("euclidean", args)
 

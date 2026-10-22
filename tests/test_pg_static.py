@@ -149,6 +149,23 @@ class StaticIntegrationTests(unittest.TestCase):
                 np.testing.assert_array_equal(adapter.get_batch_results()[:,0],np.arange(4))
             with self.assertRaises(ValueError):
                 adapter.set_query_arguments({"random_io":"off"})
+            # Single-query session setup caching must notice budget/grouping
+            # changes too, not silently keep the old backend GUC values.
+            defaults = {name: adapter.conn.execute("SHOW gsvector."+name).fetchone()[0]
+                        for name in ("federate_k", "grouped_rerank")}
+            for budget, grouped in ((2, True), (3, False), (None, None)):
+                args = {"search_l": 200, "threads": 2, "reuse_connections": True}
+                if budget is not None:
+                    args.update(federate_k=budget, grouped_rerank=grouped)
+                adapter.set_query_arguments(args)
+                adapter.query(data[0], 10)
+                adapter.batch_query(data[:4], 10)
+                for conn in [adapter.conn, *adapter._query_connections]:
+                    self.assertEqual(float(conn.execute("SHOW gsvector.federate_k").fetchone()[0]),
+                                     float(defaults["federate_k"]) if budget is None else budget)
+                    self.assertEqual(conn.execute("SHOW gsvector.grouped_rerank").fetchone()[0],
+                                     defaults["grouped_rerank"] if grouped is None else
+                                     "on" if grouped else "off")
         finally:
             adapter.done()
 

@@ -6,6 +6,7 @@ mutations use the index's memtable/drain paths and optional full compaction.
 """
 import json
 import hashlib
+import math
 import os
 from pathlib import Path
 import struct
@@ -24,6 +25,7 @@ import psutil
 
 from neurips23.streaming.base import BaseStreamingANN
 from neurips23.streaming.gsvector.maintenance import ReclaimPlanner, ReclaimThreshold
+from neurips23.streaming.gsvector.input_cache import release_consumed_input
 
 
 class VectorBytes(bytes):
@@ -87,9 +89,16 @@ class Gsvector(BaseStreamingANN):
                    "min_run_rows", "compaction", "compact_max_rows", "build_beam_first",
                    "build_neighbor_codes", "pq_m", "reclaim_max_rows",
                    "reclaim_max_runs", "reclaim_cooldown", "reclaim_min_dead",
-                   "reclaim_min_dead_fraction"}
+                   "reclaim_min_dead_fraction", "reclaim_backoff_max", "release_input_cache",
+                   "vacuum_memtables"}
         if set(self.params) - allowed:
             raise ValueError(f"unknown index parameters: {set(self.params) - allowed}")
+        self.release_input_cache = self.params.get("release_input_cache", False)
+        if not isinstance(self.release_input_cache, bool):
+            raise ValueError("release_input_cache must be boolean")
+        self.vacuum_memtables = self.params.get("vacuum_memtables", False)
+        if not isinstance(self.vacuum_memtables, bool):
+            raise ValueError("vacuum_memtables must be boolean")
         self.R = int(self.params.get("R", 32))
         self.L = int(self.params.get("L", 100))
         self.alpha = float(self.params.get("alpha", 1.2))
@@ -123,10 +132,15 @@ class Gsvector(BaseStreamingANN):
         self.reclaim_min_dead_fraction = self.params.get("reclaim_min_dead_fraction", 0)
         self.reclaim_threshold = ReclaimThreshold(
             self.reclaim_min_dead, self.reclaim_min_dead_fraction)
+        self.reclaim_backoff_max = self.params.get("reclaim_backoff_max", 0)
+        if (type(self.reclaim_backoff_max) is not int or
+                not 0 <= self.reclaim_backoff_max <= 1000000 or
+                (self.reclaim_backoff_max and self.reclaim_backoff_max < self.reclaim_cooldown)):
+            raise ValueError("reclaim_backoff_max must be zero or in reclaim_cooldown..1000000")
         if self.reclaim_max_rows and self.compaction != "tiered":
             raise ValueError("explicit reclamation requires compaction=tiered; no full fallback")
         self.reclaim_planner = (ReclaimPlanner(self.reclaim_max_rows, self.reclaim_max_runs,
-                                             self.reclaim_cooldown)
+                                             self.reclaim_cooldown, self.reclaim_backoff_max)
                                 if self.reclaim_max_rows else None)
         self._reclaim_dirty = False
         self.min_run_rows = int(self.params.get("min_run_rows", 32768))
@@ -282,6 +296,19 @@ class Gsvector(BaseStreamingANN):
             for block in binary_copy_blocks(X, ids):
                 copy.write(block)
 
+    def _release_input(self, X):
+        if not self.release_input_cache:
+            return
+        started = time.perf_counter()
+        receipt = release_consumed_input(X)
+        for name in ("eligible_bytes", "advised_bytes"):
+            key = "input_cache_" + name
+            self.maintenance_totals[key] = self.maintenance_totals.get(key, 0) + receipt[name]
+        for key, value in (("input_cache_calls", 1),
+                           ("input_cache_errors", int(receipt["error"] is not None)),
+                           ("input_cache_s", time.perf_counter() - started)):
+            self.maintenance_totals[key] = self.maintenance_totals.get(key, 0) + value
+
     def _build_index(self):
         if self.pq_m and (self.dim <= 0 or self.dim % self.pq_m):
             raise ValueError("pq_m must divide the indexed dimension")
@@ -369,13 +396,30 @@ class Gsvector(BaseStreamingANN):
                     raise ValueError("invalid reclamation receipt")
                 if (result["outcome"] in {"reclaimed", "retired"}) != (receipt > 0):
                     raise ValueError("reclamation receipt/outcome disagreement")
+                self.reclaim_planner.record_outcome(run_id, result["outcome"])
                 if result["outcome"] == "reclaimed":
                     self.reclaim_planner.defer(receipt)
                 outcomes.append({"target_run_id": run_id, "planned_input_rows": rows,
-                                 **result, "min_reclaimable_rows": minimum})
+                                 **result, "min_reclaimable_rows": minimum,
+                                 "retry_after_rounds": max(
+                                     0, self.reclaim_planner.due.get(run_id, 0)
+                                     - self.reclaim_planner.tick)})
             self._record("maintenance_reclaim", round=self.reclaim_planner.tick,
                          planned_input_rows=sum(n for _, n in jobs),
                          outcomes=outcomes, oversized_runs=oversized)
+        if self.vacuum_memtables:
+            # Logically empty is not physically empty. The index's base-table
+            # VACUUM cleanup only attempts to truncate the non-active MT slot.
+            # A reused active slot can retain a large empty heap which every
+            # ANN query must scan for MVCC-visible entries.
+            #
+            # Use PostgreSQL VACUUM, not SQL TRUNCATE, row-count shortcuts or
+            # catalog statistics: old snapshots and in-flight writers must
+            # retain their tuples. Each command commits before the next query.
+            oid = self.conn.execute("SELECT %s::regclass::oid", (index,)).fetchone()[0]
+            for slot in (0, 1):
+                execute("vacuum_mt", sql.SQL("VACUUM (PARALLEL 0) {}.{}").format(
+                    sql.Identifier("gsvector"), sql.Identifier(f"mt.{oid}.{slot}")))
 
     def insert(self, X, ids):
         start = time.perf_counter()
@@ -388,6 +432,7 @@ class Gsvector(BaseStreamingANN):
             with self.conn.transaction():
                 self._copy("base", X[offset:end], ids[offset:end])
             self.live_count += end - offset
+            self._release_input(X[offset:end])
             if self.index_ready:
                 self._maintenance()
         if len(ids) and not self.index_ready:
@@ -426,6 +471,7 @@ class Gsvector(BaseStreamingANN):
                 if replaced != end - offset:
                     raise ValueError("replace contains inactive IDs")
             self._reclaim_dirty = True
+            self._release_input(X[offset:end])
             self._maintenance()
         self.mutated = True
         self._record("replace", rows=len(ids), elapsed_s=time.perf_counter() - start, runs=self._runs())
@@ -435,9 +481,10 @@ class Gsvector(BaseStreamingANN):
 
     def _set_query_arguments(self, query_args, reset_workload):
         args = dict(query_args)
-        if set(args) - {"search_l", "threads", "random_io", "reuse_connections", "fed_run_pool_max"}:
+        if set(args) - {"search_l", "threads", "random_io", "reuse_connections", "fed_run_pool_max",
+                       "grouped_rerank", "federate_k"}:
             raise ValueError(f"unknown query arguments: {args}")
-        for name in ("random_io", "reuse_connections"):
+        for name in ("random_io", "reuse_connections", "grouped_rerank"):
             if name in args and not isinstance(args[name], bool):
                 raise ValueError(f"{name} must be boolean")
         search_l = int(args.get("search_l", 200))
@@ -446,6 +493,10 @@ class Gsvector(BaseStreamingANN):
             raise ValueError("invalid search_l or threads")
         if "fed_run_pool_max" in args and not 0 <= int(args["fed_run_pool_max"]) <= 1024:
             raise ValueError("fed_run_pool_max must be in 0..1024")
+        if "federate_k" in args:
+            value = args["federate_k"]
+            if type(value) not in (int, float) or not 1 <= value <= 8 or not math.isfinite(value):
+                raise ValueError("federate_k must be a finite number in 1..8")
         # Official runner replays the runbook for each argument group.
         if self.mutated and reset_workload:
             self._new_workload()
@@ -453,11 +504,13 @@ class Gsvector(BaseStreamingANN):
               args.get("reuse_connections", False) != self.query_args.get("reuse_connections", False)):
             self._close_query_pool()
         self.query_args = {"search_l": search_l, "threads": threads}
-        for name in ("random_io", "reuse_connections"):
+        for name in ("random_io", "reuse_connections", "grouped_rerank"):
             if name in args:
                 self.query_args[name] = args[name]
         if "fed_run_pool_max" in args:
             self.query_args["fed_run_pool_max"] = int(args["fed_run_pool_max"])
+        if "federate_k" in args:
+            self.query_args["federate_k"] = args["federate_k"]
 
     def _apply_random_io(self, conn):
         # Omitted option inherits the connection default (including PGOPTIONS).
@@ -479,6 +532,22 @@ class Gsvector(BaseStreamingANN):
             conn.execute("RESET gsvector.fed_run_pool_max")
         if conn is self.conn:
             self._single_pool_max_overridden = "fed_run_pool_max" in self.query_args
+        if "grouped_rerank" in self.query_args:
+            conn.execute("SELECT set_config('gsvector.grouped_rerank',%s,false)",
+                         ("on" if self.query_args["grouped_rerank"] else "off",))
+        elif ((conn is self.conn and getattr(self, "_single_grouped_overridden", False)) or
+              (conn is not self.conn and self.query_args.get("reuse_connections", False))):
+            conn.execute("RESET gsvector.grouped_rerank")
+        if conn is self.conn:
+            self._single_grouped_overridden = "grouped_rerank" in self.query_args
+        if "federate_k" in self.query_args:
+            conn.execute("SELECT set_config('gsvector.federate_k',%s,false)",
+                         (str(self.query_args["federate_k"]),))
+        elif ((conn is self.conn and getattr(self, "_single_federate_overridden", False)) or
+              (conn is not self.conn and self.query_args.get("reuse_connections", False))):
+            conn.execute("RESET gsvector.federate_k")
+        if conn is self.conn:
+            self._single_federate_overridden = "federate_k" in self.query_args
 
     def _query_chunk(self, queries, k):
         with self._query_connection() as conn:

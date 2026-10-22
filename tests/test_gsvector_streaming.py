@@ -1,5 +1,6 @@
 import json
 import os
+from pathlib import Path
 import struct
 import tempfile
 import unittest
@@ -14,6 +15,33 @@ from neurips23.streaming.gsvector.module import (
 
 
 class EncodingTests(unittest.TestCase):
+    def test_input_release_is_opt_in_and_follows_successful_copy(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
+            "GSVECTOR_PG_DSN": "dbname=not_connected", "GSVECTOR_ARTIFACTS": directory,
+        }):
+            for enabled in (False, True):
+                adapter = Gsvector("euclidean", {"release_input_cache": enabled})
+                adapter.dim, adapter.max_pts = 4, 100
+                adapter.conn = MagicMock()
+                adapter._copy = MagicMock()
+                adapter._build_index = MagicMock()
+                adapter._runs = MagicMock(return_value=[])
+                adapter._record = MagicMock()
+                try:
+                    with patch("neurips23.streaming.gsvector.module.release_consumed_input",
+                               return_value={"eligible_bytes": 4096, "advised_bytes": 4096,
+                                             "error": None}) as release:
+                        adapter.insert(np.ones((20, 4)), np.arange(20))
+                        self.assertEqual(release.call_count, int(enabled))
+                        if enabled:
+                            self.assertEqual(adapter.maintenance_totals["input_cache_advised_bytes"], 4096)
+                        adapter._copy.side_effect = RuntimeError("COPY failed")
+                        with self.assertRaisesRegex(RuntimeError, "COPY failed"):
+                            adapter.insert(np.ones((20, 4)), np.arange(20, 40))
+                        self.assertEqual(release.call_count, int(enabled))
+                finally:
+                    adapter.done()
+
     def test_pq_subspace_validation_and_default_sql(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
             "GSVECTOR_PG_DSN": "dbname=not_connected", "GSVECTOR_ARTIFACTS": directory,
@@ -48,7 +76,8 @@ class EncodingTests(unittest.TestCase):
             for value in (-1, 2147483648):
                 with self.assertRaises(ValueError):
                     Gsvector("euclidean", {"compact_max_rows": value})
-            for name in ("build_beam_first", "build_neighbor_codes"):
+            for name in ("build_beam_first", "build_neighbor_codes", "release_input_cache",
+                         "vacuum_memtables"):
                 with self.assertRaises(ValueError):
                     Gsvector("euclidean", {name: "on"})
             adapter = Gsvector("euclidean", {"compact_max_rows": 500000})
@@ -94,6 +123,121 @@ class EncodingTests(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get("GSVECTOR_PG_DSN"), "requires dedicated test PostgreSQL")
 class PostgreSQLTests(unittest.TestCase):
+    def test_memtable_vacuum_preserves_old_snapshot_and_releases_empty_storage(self):
+        vectors = np.random.default_rng(20261023).normal(size=(256, 32)).astype("float32")
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
+                "GSVECTOR_ARTIFACTS": directory, "GSVECTOR_KEEP_SCHEMA": "0"}):
+            adapter = Gsvector("euclidean", {
+                "R": 8, "L": 32, "min_run_rows": 0, "batch_rows": 128,
+                "build_threads": 1, "compact_runs": 4, "compaction": "tiered",
+                "compact_max_rows": 128, "vacuum_memtables": True,
+            })
+            try:
+                adapter.setup("float32", 256, 32)
+                adapter.insert(vectors[:128], np.arange(128, dtype=np.uint32))
+                # Leave committed rows in the MT before pinning the reader's
+                # snapshot; drain will delete these versions afterwards.
+                with adapter.conn.transaction():
+                    adapter._copy("base", vectors[128:], np.arange(128, 256, dtype=np.uint32))
+                adapter.live_count += 128
+                oid = adapter.conn.execute("SELECT %s::regclass::oid",
+                                           (adapter.schema+".ann_idx",)).fetchone()[0]
+                with psycopg.connect(adapter.dsn, autocommit=True) as old:
+                    old.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+                    old.execute(f'SELECT count(*) FROM "{adapter.schema}".base').fetchone()
+                    def mt_rows(connection):
+                        return sum(connection.execute(
+                            f'SELECT count(*) FROM gsvector."mt.{oid}.{slot}"').fetchone()[0]
+                                   for slot in (0, 1))
+                    self.assertEqual(mt_rows(old), 128)
+                    adapter._maintenance()
+                    self.assertEqual(mt_rows(old), 128)
+                    self.assertEqual(mt_rows(adapter.conn), 0)
+                    adapter.delete(np.arange(128, dtype=np.uint32))
+                    self.assertEqual(old.execute(
+                        f'SELECT count(*) FROM "{adapter.schema}".base').fetchone()[0], 256)
+                    old.execute("ROLLBACK")
+                adapter._maintenance()
+                self.assertGreaterEqual(adapter.maintenance_totals["vacuum_mt_calls"], 6)
+                for slot in (0, 1):
+                    name = f'gsvector."mt.{oid}.{slot}"'
+                    self.assertEqual(adapter.conn.execute(
+                        "SELECT pg_relation_size(%s::regclass)", (name,)).fetchone()[0], 0)
+                adapter.query(vectors[128:136], 8)
+                np.testing.assert_array_equal(adapter.get_results()[:, 0], np.arange(128, 136))
+            finally:
+                adapter.done()
+
+    def test_readonly_input_drop_behind_insert_and_replace(self):
+        vectors = np.random.default_rng(20261022).normal(size=(128, 32)).astype("float32")
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
+                "GSVECTOR_ARTIFACTS": directory, "GSVECTOR_KEEP_SCHEMA": "0"}):
+            path = Path(directory) / "vectors.bin"
+            path.write_bytes(b"12345678" + vectors.tobytes())
+            with path.open("rb") as stream:
+                os.fsync(stream.fileno())
+            mapped = np.memmap(path, mode="r", dtype="float32", offset=8, shape=vectors.shape)
+            adapter = Gsvector("euclidean", {
+                "R": 8, "L": 32, "min_run_rows": 0, "batch_rows": 64,
+                "build_threads": 1, "compact_runs": 4, "compaction": "tiered",
+                "compact_max_rows": 64, "release_input_cache": True,
+            })
+            try:
+                adapter.setup("float32", 128, 32)
+                adapter.insert(mapped[:64], np.arange(64, dtype=np.uint32))
+                adapter.replace(mapped[64:], np.arange(64, dtype=np.uint32))
+                self.assertEqual(adapter.maintenance_totals["input_cache_errors"], 0)
+                self.assertGreater(adapter.maintenance_totals["input_cache_advised_bytes"], 0)
+                np.testing.assert_array_equal(mapped, vectors)
+                adapter.query(vectors[64:72], 8)
+                np.testing.assert_array_equal(adapter.get_results()[:, 0], np.arange(8))
+                self.assertEqual(path.read_bytes(), b"12345678" + vectors.tobytes())
+            finally:
+                adapter.done()
+
+    def test_backoff_retries_after_pinned_snapshot_and_grouped_results_match(self):
+        vectors = np.random.default_rng(20261022).normal(size=(64, 32)).astype("float32")
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
+                "GSVECTOR_ARTIFACTS": directory, "GSVECTOR_KEEP_SCHEMA": "0"}):
+            adapter = Gsvector("euclidean", {
+                "R": 8, "L": 32, "min_run_rows": 0, "batch_rows": 64,
+                "build_threads": 1, "compact_runs": 4, "compaction": "tiered",
+                "compact_max_rows": 64, "reclaim_max_rows": 64,
+                "reclaim_cooldown": 2, "reclaim_backoff_max": 8,
+            })
+            try:
+                adapter.setup("float32", 128, 32)
+                adapter.insert(vectors, np.arange(64, dtype=np.uint32))
+                with psycopg.connect(adapter.dsn, autocommit=True) as old:
+                    old.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+                    self.assertEqual(old.execute(
+                        f'SELECT count(*) FROM "{adapter.schema}".base').fetchone()[0], 64)
+                    adapter.delete(np.arange(8, 64, dtype=np.uint32))
+                    for _ in range(4):
+                        adapter._maintenance()
+                    self.assertEqual(adapter.maintenance_totals["reclaim_calls"], 2)
+                    self.assertEqual(sum(r[1] for r in adapter._runs()), 64)
+                    self.assertEqual(old.execute(
+                        f'SELECT count(*) FROM "{adapter.schema}".base').fetchone()[0], 64)
+                    old.execute("ROLLBACK")
+                # No new deletion: the capped retry must still reclaim safely.
+                for _ in range(8):
+                    adapter._maintenance()
+                self.assertEqual(adapter.maintenance_totals["reclaim_calls"], 3)
+                self.assertEqual(sum(r[1] for r in adapter._runs()), 8)
+                results = []
+                for grouped in (False, True, True, False):
+                    adapter._set_query_arguments(
+                        {"search_l": 100, "threads": 2, "reuse_connections": True,
+                         "grouped_rerank": grouped}, reset_workload=False)
+                    adapter.query(vectors[:8], 8)
+                    results.append(adapter.get_results().copy())
+                for result in results:
+                    np.testing.assert_array_equal(result[:, 0], np.arange(8))
+                    np.testing.assert_array_equal(result, results[0])
+            finally:
+                adapter.done()
+
     def test_fraction_reclamation_threshold_and_absolute_floor(self):
         for rows, fraction, absolute, threshold in ((64, .2, 1, 13),
                                                      (64, .2, 20, 20),
@@ -281,11 +425,14 @@ class PostgreSQLTests(unittest.TestCase):
                 np.testing.assert_array_equal(adapter.get_results()[:, 0], np.arange(8))
                 # Change session settings without replaying the workload.
                 adapter._set_query_arguments({"search_l": 100, "threads": 2,
-                    "reuse_connections": True, "random_io": True, "fed_run_pool_max": 32}, reset_workload=False)
+                    "reuse_connections": True, "random_io": True, "fed_run_pool_max": 32,
+                    "grouped_rerank": True}, reset_workload=False)
                 adapter.query(vectors[:8], 10)
                 for connection in connections:
                     self.assertEqual(connection.execute(
                         "SHOW gsvector.fed_run_pool_max").fetchone()[0], "32")
+                    self.assertEqual(connection.execute(
+                        "SHOW gsvector.grouped_rerank").fetchone()[0], "on")
                 adapter._set_query_arguments({"search_l": 100, "threads": 2,
                     "reuse_connections": True}, reset_workload=False)
                 adapter.query(vectors[:8], 10)
@@ -294,6 +441,8 @@ class PostgreSQLTests(unittest.TestCase):
                         "SHOW gsvector.query_random_io").fetchone()[0], "off")
                     self.assertEqual(connection.execute(
                         "SHOW gsvector.fed_run_pool_max").fetchone()[0], "8")
+                    self.assertEqual(connection.execute(
+                        "SHOW gsvector.grouped_rerank").fetchone()[0], "off")
                 adapter.set_query_arguments({"search_l": 100, "threads": 1})
                 self.assertTrue(all(connection.closed for connection in connections))
                 self.assertEqual(adapter.live_count, 0)
