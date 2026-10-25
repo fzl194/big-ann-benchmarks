@@ -20,12 +20,42 @@ import numpy as np
 import psycopg
 from psycopg import sql
 from psycopg.adapt import Dumper
-from psycopg.pq import Format
+from psycopg.pq import Format, TransactionStatus
 import psutil
 
 from neurips23.streaming.base import BaseStreamingANN
 from neurips23.streaming.gsvector.maintenance import ReclaimPlanner, ReclaimThreshold
 from neurips23.streaming.gsvector.input_cache import release_consumed_input
+
+
+class QueryCardinalityError(RuntimeError):
+    def __init__(self, found, expected, completed_queries=0):
+        super().__init__(f"ANN returned {found} results, expected {expected}")
+        self.found, self.expected = found, expected
+        self.completed_queries = completed_queries
+        self.completed_queries_total = completed_queries
+
+
+def gather_query_chunks(futures):
+    """Wait for all chunks; never hide SQL/corruption errors behind a shortfall."""
+    results, errors = [], []
+    completed = 0
+    for future in futures:
+        try:
+            result = future.result()
+            results.append(result)
+            completed += len(result)
+        except Exception as exc:
+            errors.append(exc)
+            results.append(None)
+            completed += getattr(exc, "completed_queries", 0)
+    if errors:
+        for exc in errors:
+            if not isinstance(exc, QueryCardinalityError):
+                raise exc
+        errors[0].completed_queries_total = completed
+        raise errors[0]
+    return results
 
 
 class VectorBytes(bytes):
@@ -90,7 +120,7 @@ class Gsvector(BaseStreamingANN):
                    "build_neighbor_codes", "pq_m", "reclaim_max_rows",
                    "reclaim_max_runs", "reclaim_cooldown", "reclaim_min_dead",
                    "reclaim_min_dead_fraction", "reclaim_backoff_max", "release_input_cache",
-                   "vacuum_memtables"}
+                   "vacuum_memtables", "trim_allocator", "reconnect_writer"}
         if set(self.params) - allowed:
             raise ValueError(f"unknown index parameters: {set(self.params) - allowed}")
         self.release_input_cache = self.params.get("release_input_cache", False)
@@ -99,6 +129,12 @@ class Gsvector(BaseStreamingANN):
         self.vacuum_memtables = self.params.get("vacuum_memtables", False)
         if not isinstance(self.vacuum_memtables, bool):
             raise ValueError("vacuum_memtables must be boolean")
+        self.trim_allocator = self.params.get("trim_allocator", False)
+        if not isinstance(self.trim_allocator, bool):
+            raise ValueError("trim_allocator must be boolean")
+        self.reconnect_writer = self.params.get("reconnect_writer", False)
+        if not isinstance(self.reconnect_writer, bool):
+            raise ValueError("reconnect_writer must be boolean")
         self.R = int(self.params.get("R", 32))
         self.L = int(self.params.get("L", 100))
         self.alpha = float(self.params.get("alpha", 1.2))
@@ -191,6 +227,11 @@ class Gsvector(BaseStreamingANN):
             self.conn = None
             raise ValueError("reclamation requires gsvector 0.1.8 API; upgrade explicitly")
         self.vector_oid = self.conn.execute("SELECT 'vector'::regtype::oid").fetchone()[0]
+        if self.trim_allocator and not self.conn.execute(
+                "SELECT to_regprocedure('public.gs_trim_allocator()') IS NOT NULL").fetchone()[0]:
+            self.conn.close()
+            self.conn = None
+            raise ValueError("trim_allocator requires the explicitly installed allocator helper")
         # A separate private schema per workload, including each query-arg sweep.
         self._new_workload()
 
@@ -212,7 +253,14 @@ class Gsvector(BaseStreamingANN):
         self.conn.execute(sql.SQL(
             "CREATE TABLE base (id bigint PRIMARY KEY, embedding vector({}) NOT NULL)"
         ).format(sql.Literal(self.dim)))
-        self.conn.execute("CREATE TEMP TABLE IF NOT EXISTS incoming "
+        self._configure_write_connection(self.conn, set_search_path=False)
+        self._record("setup", dimension=self.dim, max_pts=self.max_pts,
+                     metric=self.metric, parameters=self.params)
+
+    def _configure_write_connection(self, conn, set_search_path=True):
+        if set_search_path:
+            conn.execute(sql.SQL("SET search_path TO {}, public").format(sql.Identifier(self.schema)))
+        conn.execute("CREATE TEMP TABLE IF NOT EXISTS incoming "
                           "(id bigint PRIMARY KEY, embedding vector NOT NULL) ON COMMIT DELETE ROWS")
         for name, value in {
             "gsvector.build_threads": self.build_threads,
@@ -220,18 +268,39 @@ class Gsvector(BaseStreamingANN):
             "gsvector.flush_threshold": min(self.batch_rows, 1000000),
             "gsvector.merge_runs": min(self.compact_runs,1024),
         }.items():
-            self.conn.execute("SELECT set_config(%s,%s,false)", (name, str(value)))
+            conn.execute("SELECT set_config(%s,%s,false)", (name, str(value)))
         if "compact_max_rows" in self.params:
-            self.conn.execute("SELECT set_config('gsvector.compact_max_rows',%s,false)",
+            conn.execute("SELECT set_config('gsvector.compact_max_rows',%s,false)",
                               (str(self.compact_max_rows),))
         if "build_beam_first" in self.params:
-            self.conn.execute("SELECT set_config('gsvector.build_beam_first',%s,false)",
+            conn.execute("SELECT set_config('gsvector.build_beam_first',%s,false)",
                               ("on" if self.build_beam_first else "off",))
         if "build_neighbor_codes" in self.params:
-            self.conn.execute("SELECT set_config('gsvector.build_neighbor_codes',%s,false)",
+            conn.execute("SELECT set_config('gsvector.build_neighbor_codes',%s,false)",
                               ("on" if self.build_neighbor_codes else "off",))
-        self._record("setup", dimension=self.dim, max_pts=self.max_pts,
-                     metric=self.metric, parameters=self.params)
+
+    def _reconnect_writer(self):
+        if not self.reconnect_writer:
+            return
+        old = self.conn
+        if old.info.transaction_status != TransactionStatus.IDLE:
+            raise RuntimeError("writer reconnect requires a committed, idle connection")
+        started = time.perf_counter()
+        new = psycopg.connect(self.dsn, autocommit=True)
+        try:
+            self._configure_write_connection(new)
+        except BaseException:
+            new.close()
+            raise
+        self.conn = new
+        old.close()
+        # A new writer also needs fresh single-query adapter/dumper settings.
+        for name in list(vars(self)):
+            if name.startswith("_single_"):
+                delattr(self, name)
+        for key, value in (("writer_reconnect_s", time.perf_counter() - started),
+                           ("writer_reconnect_calls", 1)):
+            self.maintenance_totals[key] = self.maintenance_totals.get(key, 0) + value
 
     def _close_query_pool(self):
         # Workers must stop before their backend handles are closed. Autocommit
@@ -322,6 +391,20 @@ class Gsvector(BaseStreamingANN):
                  sql.Literal(self.L), sql.Literal(self.alpha), pq_option))
         self.index_ready = True
         self.conn.execute("ANALYZE base")
+        self._trim_allocator()
+        self._reconnect_writer()
+
+    def _trim_allocator(self):
+        if not self.trim_allocator:
+            return
+        started = time.perf_counter()
+        released = self.conn.execute("SELECT public.gs_trim_allocator()").fetchone()[0]
+        if not isinstance(released, bool):
+            raise ValueError("unexpected allocator helper result")
+        for key, value in (("allocator_trim_s", time.perf_counter() - started),
+                           ("allocator_trim_calls", 1),
+                           ("allocator_trim_reported_releases", int(released))):
+            self.maintenance_totals[key] = self.maintenance_totals.get(key, 0) + value
 
     def _runs(self):
         if not self.index_ready:
@@ -420,6 +503,8 @@ class Gsvector(BaseStreamingANN):
             for slot in (0, 1):
                 execute("vacuum_mt", sql.SQL("VACUUM (PARALLEL 0) {}.{}").format(
                     sql.Identifier("gsvector"), sql.Identifier(f"mt.{oid}.{slot}")))
+        self._trim_allocator()
+        self._reconnect_writer()
 
     def insert(self, X, ids):
         start = time.perf_counter()
@@ -482,8 +567,18 @@ class Gsvector(BaseStreamingANN):
     def _set_query_arguments(self, query_args, reset_workload):
         args = dict(query_args)
         if set(args) - {"search_l", "threads", "random_io", "reuse_connections", "fed_run_pool_max",
-                       "grouped_rerank", "federate_k"}:
+                       "grouped_rerank", "federate_k", "query_order", "query_dispatch",
+                       "query_batch_size", "max_k"}:
             raise ValueError(f"unknown query arguments: {args}")
+        if args.get("query_order", "input") not in ("input", "locality"):
+            raise ValueError("query_order must be input or locality")
+        if args.get("query_dispatch", "contiguous") not in ("contiguous", "interleaved"):
+            raise ValueError("query_dispatch must be contiguous or interleaved")
+        batch_size = args.get("query_batch_size", 1)
+        if type(batch_size) is not int or not 1 <= batch_size <= 32:
+            raise ValueError("query_batch_size must be an integer in 1..32")
+        if "max_k" in args and (type(args["max_k"]) is not int or not 1 <= args["max_k"] <= 32768):
+            raise ValueError("max_k must be an integer in 1..32768")
         for name in ("random_io", "reuse_connections", "grouped_rerank"):
             if name in args and not isinstance(args[name], bool):
                 raise ValueError(f"{name} must be boolean")
@@ -511,6 +606,9 @@ class Gsvector(BaseStreamingANN):
             self.query_args["fed_run_pool_max"] = int(args["fed_run_pool_max"])
         if "federate_k" in args:
             self.query_args["federate_k"] = args["federate_k"]
+        for name in ("query_order", "query_dispatch", "query_batch_size", "max_k"):
+            if name in args:
+                self.query_args[name] = args[name]
 
     def _apply_random_io(self, conn):
         # Omitted option inherits the connection default (including PGOPTIONS).
@@ -548,6 +646,14 @@ class Gsvector(BaseStreamingANN):
             conn.execute("RESET gsvector.federate_k")
         if conn is self.conn:
             self._single_federate_overridden = "federate_k" in self.query_args
+        if "max_k" in self.query_args:
+            conn.execute("SELECT set_config('gsvector.max_k',%s,false)",
+                         (str(self.query_args["max_k"]),))
+        elif ((conn is self.conn and getattr(self, "_single_max_k_overridden", False)) or
+              (conn is not self.conn and self.query_args.get("reuse_connections", False))):
+            conn.execute("RESET gsvector.max_k")
+        if conn is self.conn:
+            self._single_max_k_overridden = "max_k" in self.query_args
 
     def _query_chunk(self, queries, k):
         with self._query_connection() as conn:
@@ -576,9 +682,38 @@ class Gsvector(BaseStreamingANN):
                     raise RuntimeError(f"ANN index plan required: {plan}")
             result = np.full((len(queries), k), -1, dtype=np.int32)
             expected = min(k, self.live_count)
+            batch_size = self.query_args.get("query_batch_size", 1)
+            if batch_size > 1:
+                # Experimental SRF explicitly installed in the owned test DB.
+                # Uses a statement snapshot and the normal scan correctness
+                # path; collection and exact rerank are scheduled run-major.
+                for start in range(0, len(queries), batch_size):
+                    batch = queries[start:start + batch_size]
+                    slots = ",".join(["%s"] * len(batch))
+                    statement_batch = (
+                        "SELECT b.query_no,t.id FROM public.gs_ann_batch("
+                        f"%s::regclass,ARRAY[{slots}]::vector[],%s) b "
+                        "JOIN base t ON t.ctid=b.tid "
+                        "ORDER BY b.query_no,b.dist,b.tid")
+                    rows = conn.execute(statement_batch, (
+                        f"{self.schema}.ann_idx", *[encode_vector(q) for q in batch], k)).fetchall()
+                    grouped = [[] for _ in batch]
+                    for ordinal, identifier in rows:
+                        if not 0 <= ordinal < len(batch):
+                            raise RuntimeError("batch ANN returned an invalid query ordinal")
+                        grouped[ordinal].append(identifier)
+                    for i, values in enumerate(grouped):
+                        if len(values) < expected:
+                            raise QueryCardinalityError(len(values), expected, start + len(batch))
+                        if len(values) != expected or len(set(values)) != len(values):
+                            raise RuntimeError("batch ANN cardinality/uniqueness mismatch")
+                        result[start + i, :len(values)] = values
+                return result
             for i, query in enumerate(queries):
                 rows = conn.execute(statement, (encode_vector(query), k)).fetchall()
                 values = [row[0] for row in rows]
+                if len(values) < expected:
+                    raise QueryCardinalityError(len(values), expected, i + 1)
                 if len(values) != expected or len(set(values)) != len(values):
                     raise RuntimeError(f"ANN returned {len(values)} results, expected {expected}")
                 result[i, :len(values)] = values
@@ -595,10 +730,23 @@ class Gsvector(BaseStreamingANN):
             self._build_index()
         if self.pool is None:
             self.pool = ThreadPoolExecutor(max_workers=self.query_args["threads"])
-        chunks = [chunk for chunk in np.array_split(X, self.query_args["threads"]) if len(chunk)]
-        futures = [self.pool.submit(self._query_chunk, chunk, k) for chunk in chunks]
-        self.res = (np.concatenate([future.result() for future in futures]) if chunks else
-                    np.empty((0, k), dtype=np.int32))
+        if (self.query_args.get("query_order", "input") == "input" and
+                self.query_args.get("query_dispatch", "contiguous") == "contiguous"):
+            # Preserve the original path, including its zero-copy query slices.
+            chunks = [chunk for chunk in np.array_split(X, self.query_args["threads"]) if len(chunk)]
+            futures = [self.pool.submit(self._query_chunk, chunk, k) for chunk in chunks]
+            self.res = (np.concatenate(gather_query_chunks(futures)) if chunks else
+                        np.empty((0, k), dtype=np.int32))
+        else:
+            from .query_order import query_partitions
+            partitions = query_partitions(
+                X, self.query_args["threads"], self.query_args.get("query_order", "input"),
+                self.query_args.get("query_dispatch", "contiguous"))
+            futures = [self.pool.submit(self._query_chunk, X[indices], k)
+                       for indices in partitions]
+            self.res = np.empty((len(X), k), dtype=np.int32)
+            for indices, result in zip(partitions, gather_query_chunks(futures)):
+                self.res[indices] = result
         self.search_number += 1
         evidence = {}
         if os.environ.get("GSVECTOR_SAVE_CHECKPOINTS") == "1":
