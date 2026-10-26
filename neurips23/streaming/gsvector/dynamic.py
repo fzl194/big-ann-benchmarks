@@ -2,8 +2,8 @@
 
 Requires the separately installed experimental gsvector_streaming SQL backend,
 an explicitly configured local worker, and one common memory/CPU resource scope.
-This is a batch SQL query path; it is not a timing of individual ORDER BY scans.
-The existing Gsvector adapter and every other track remain unchanged.
+query_mode selects batch SQL or independent ORDER BY index scans. The existing
+Gsvector adapter and every other track remain unchanged.
 """
 import os
 from pathlib import Path
@@ -18,7 +18,7 @@ class GsvectorDynamic(BaseStreamingANN):
     def __init__(self, metric, index_params):
         if metric != "euclidean":
             raise ValueError("dynamic Streaming backend currently supports L2 only")
-        allowed = {"R", "L", "build_threads", "create_index"}
+        allowed = {"R", "L", "build_threads", "create_index", "query_mode"}
         if set(index_params) - allowed:
             raise ValueError("unknown dynamic Streaming index parameter")
         self.params = dict(index_params)
@@ -47,7 +47,8 @@ class GsvectorDynamic(BaseStreamingANN):
             self.dimensions, self.capacity, self.params.get("build_threads", 32),
             os.environ["GSVECTOR_STREAMING_SOCKET"],
             self.params.get("R", 32), self.params.get("L", 100),
-            self.search_l, self.params.get("create_index", True))
+            self.search_l, self.params.get("create_index", True),
+            self.params.get("query_mode", "batch"))
         self.started = False
 
     def set_query_arguments(self, query_args):
@@ -94,4 +95,4 @@ class GsvectorDynamic(BaseStreamingANN):
             self.backend = None
 
     def __str__(self):
-        return f"GsvectorDynamic(batch-SQL,R={self.params.get('R',32)},Ls={self.search_l})"
+        return f"GsvectorDynamic({self.params.get('query_mode','batch')},R={self.params.get('R',32)},Ls={self.search_l})"
