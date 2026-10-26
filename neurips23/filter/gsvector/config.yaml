@@ -1,6 +1,6 @@
 any:
   gsvector-filter:
-    docker-tag: gsvector-filter-submission-pending
+    docker-tag: vector-competition/gsvector-benchmark:release-20261026
     module: benchmark.algorithms.pg_filtered
     constructor: PGFilteredANN
     base-args: ["@metric"]
@@ -11,7 +11,7 @@ any:
         query-args: |
           [{"threads":4,"search_l":200,"initial_candidates":256,"max_candidates":8192,"exact_cutoff":2048}]
   gsvector-filter-fast:
-    docker-tag: gsvector-filter-submission-pending
+    docker-tag: vector-competition/gsvector-benchmark:release-20261026
     module: benchmark.algorithms.pg_filtered
     constructor: PGFilteredANN
     base-args: ["@metric"]
@@ -22,7 +22,7 @@ any:
         query-args: |
           [{"threads":4,"search_l":200,"initial_candidates":256,"max_candidates":8192,"exact_cutoff":2048}]
   gsvector-filter-bestfirst:
-    docker-tag: gsvector-filter-submission-pending
+    docker-tag: vector-competition/gsvector-benchmark:release-20261026
     module: benchmark.algorithms.pg_filtered
     constructor: PGFilteredANN
     base-args: ["@metric"]
@@ -33,7 +33,7 @@ any:
         query-args: |
           [{"threads":4,"search_l":200,"initial_candidates":256,"max_candidates":8192,"exact_cutoff":2048}]
   gsvector-filter-resource-wide:
-    docker-tag: gsvector-filter-submission-pending
+    docker-tag: vector-competition/gsvector-benchmark:release-20261026
     module: benchmark.algorithms.pg_filtered
     constructor: PGFilteredANN
     base-args:

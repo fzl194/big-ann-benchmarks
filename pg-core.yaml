@@ -1,6 +1,6 @@
 any:
   gsvector:
-    docker-tag: gsvector-core-submission-pending
+    docker-tag: vector-competition/gsvector-benchmark:release-20261026
     module: benchmark.algorithms.pg_dense
     constructor: PGDenseANN
     base-args:
@@ -14,7 +14,7 @@ any:
 
           '
   gsvector-random-io:
-    docker-tag: gsvector-core-submission-pending
+    docker-tag: vector-competition/gsvector-benchmark:release-20261026
     module: benchmark.algorithms.pg_dense
     constructor: PGDenseANN
     base-args:
@@ -29,7 +29,7 @@ any:
           true}, {"search_l": 800, "threads": 4, "random_io": true}, {"search_l":
           1600, "threads": 4, "random_io": true}]'
   gsvector-fast-build:
-    docker-tag: gsvector-core-submission-pending
+    docker-tag: vector-competition/gsvector-benchmark:release-20261026
     module: benchmark.algorithms.pg_dense
     constructor: PGDenseANN
     base-args: ["@metric"]
@@ -40,7 +40,7 @@ any:
         query-args: |
           [{"search_l":100,"threads":4},{"search_l":200,"threads":4},{"search_l":400,"threads":4},{"search_l":800,"threads":4},{"search_l":1600,"threads":4}]
   gsvector-resource-wide:
-    docker-tag: gsvector-core-submission-pending
+    docker-tag: vector-competition/gsvector-benchmark:release-20261026
     module: benchmark.algorithms.pg_dense
     constructor: PGDenseANN
     base-args:

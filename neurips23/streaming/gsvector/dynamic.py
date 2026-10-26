@@ -5,6 +5,7 @@ an explicitly configured local worker, and one common memory/CPU resource scope.
 query_mode selects batch SQL or independent ORDER BY index scans. The existing
 Gsvector adapter and every other track remain unchanged.
 """
+import json
 import os
 from pathlib import Path
 import sys
@@ -87,7 +88,14 @@ class GsvectorDynamic(BaseStreamingANN):
         return self.backend.get_results()
 
     def get_additional(self):
-        return self.backend.get_additional()
+        # Upstream store_results writes every value directly to an HDF5
+        # attribute. Nested Python dicts are object dtype and cannot be stored.
+        # Preserve the full diagnostic structure as deterministic JSON; neither
+        # candidate IDs nor scoring/query execution changes here.
+        details = self.backend.get_additional()["pg_dynamic_diskann"]
+        return {"pg_dynamic_diskann": json.dumps(details, sort_keys=True),
+                "pg_schema": details["schema"],
+                "query_mode": details["query_mode"]}
 
     def done(self):
         if self.backend is not None:

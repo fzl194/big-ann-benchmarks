@@ -1,6 +1,6 @@
 any:
   gsvector:
-    docker-tag: neurips23-ood-gsvector
+    docker-tag: vector-competition/gsvector-benchmark:release-20261026
     module: neurips23.ood.gsvector.module
     constructor: GsvectorOOD
     base-args: ["@metric"]
@@ -11,7 +11,7 @@ any:
         query-args: |
           [{"search_l":200,"threads":4}]
   gsvector-resource-wide:
-    docker-tag: neurips23-ood-gsvector
+    docker-tag: vector-competition/gsvector-benchmark:release-20261026
     module: neurips23.ood.gsvector.module
     constructor: GsvectorOOD
     base-args:
