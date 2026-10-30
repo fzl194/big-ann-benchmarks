@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 
 from neurips23.streaming.gsvector.module import Gsvector
+from benchmark.algorithms.pg_dense import PGDenseANN
 
 
 GUC = "gsvector.pq_rerank_frontier"
@@ -147,6 +148,51 @@ class PqFrontierRerankTests(unittest.TestCase):
             connection.execute.reset_mock()
             self.adapter._apply_random_io(connection)
             self.assertEqual([call.args for call in self.writes(connection)], [(SET_SQL, ("on",))])
+
+    def dense_single_adapter(self):
+        self.adapter.done()
+        self.adapter = PGDenseANN("euclidean", {})
+        self.adapter.schema = "owned_fixture"
+        self.adapter.dim = 2
+        self.adapter.live_count = 1
+        self.adapter.vector_oid = 1234
+        self.adapter.keep_schema = True
+        self.adapter._runs = MagicMock(return_value=[])
+        self.adapter._record = MagicMock()
+        connection = self.connection()
+        cursor = MagicMock()
+        cursor.fetchone.return_value = ("bool",)
+        cursor.fetchall.return_value = [(42,)]
+        plan = MagicMock()
+        plan.fetchone.return_value = ([{"Plan": {
+            "Node Type": "Index Scan", "Index Name": "ann_idx"}}],)
+        connection.execute.side_effect = lambda statement, *args: (
+            plan if isinstance(statement, str) and statement.startswith("EXPLAIN ") else cursor)
+        self.adapter.conn = connection
+        return connection
+
+    def test_dense_single_false_true_omitted_reconfigures_server_on_same_index(self):
+        connection = self.dense_single_adapter()
+        query = np.asarray([1, 2], dtype=np.float32)
+        for options in ({"pq_rerank_frontier": False},
+                        {"pq_rerank_frontier": True}, {}):
+            self.configure(**options)
+            np.testing.assert_array_equal(self.adapter.query(query, 1), [42])
+        self.assertEqual([call.args for call in self.writes(connection)], [
+            (SET_SQL, ("off",)), (SET_SQL, ("on",)), (SET_SQL, ("off",))])
+        records = self.adapter._record.call_args_list
+        self.assertIs(records[0].kwargs["query_args"]["pq_rerank_frontier"], False)
+        self.assertIs(records[1].kwargs["query_args"]["pq_rerank_frontier"], True)
+        self.assertNotIn("pq_rerank_frontier", records[2].kwargs["query_args"])
+
+    def test_dense_single_true_false_reconfigures_server_without_other_changes(self):
+        connection = self.dense_single_adapter()
+        query = np.asarray([1, 2], dtype=np.float32)
+        for enabled in (True, False):
+            self.configure(pq_rerank_frontier=enabled)
+            np.testing.assert_array_equal(self.adapter.query(query, 1), [42])
+        self.assertEqual([call.args for call in self.writes(connection)], [
+            (SET_SQL, ("on",)), (SET_SQL, ("off",))])
 
 
 if __name__ == "__main__":
