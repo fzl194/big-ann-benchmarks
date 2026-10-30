@@ -133,7 +133,8 @@ class PGDenseANN(Gsvector):
                      self.query_args.get("fed_run_pool_max"), self.query_args.get("grouped_rerank"),
                      self.query_args.get("federate_k"), self.query_args.get("max_k"),
                      self.query_args.get("pq_rerank_frontier"), self.query_args.get("refine_sq8"),
-                     self.query_args.get("refine_expanded_pool"), self.query_args.get("refine_u8_simd"))
+                     self.query_args.get("refine_expanded_pool"), self.query_args.get("refine_u8_simd"),
+                     self.query_args.get("refine_score_limit"))
             if getattr(self,"_single_state",None) != state:
                 class VectorDumper(Dumper):
                     oid = self.vector_oid
