@@ -50,6 +50,20 @@ class ExpandedPoolTest(unittest.TestCase):
         self.configure(refine_sq8=True,refine_expanded_pool=1)
         with self.assertRaises(RuntimeError): self.algo._apply_refine_expanded_pool(conn)
 
+    def test_reused_worker_resets_omitted_pool_and_old_server_is_safe(self):
+        owner=MagicMock(); worker=MagicMock()
+        worker.execute.return_value.fetchone.return_value=('integer',)
+        self.algo.conn=owner
+        self.configure(refine_sq8=True,refine_expanded_pool=99,reuse_connections=True)
+        self.algo._apply_refine_expanded_pool(worker)
+        self.configure(reuse_connections=True)
+        self.algo._apply_refine_expanded_pool(worker)
+        worker.execute.assert_any_call(
+            "SELECT set_config('gsvector.refine_expanded_pool',%s,false)",('0',))
+        old=MagicMock(); old.execute.return_value.fetchone.return_value=None
+        self.algo._apply_refine_expanded_pool(old)
+        self.assertFalse(any("set_config" in c.args[0] for c in old.execute.call_args_list))
+
     def test_single_query_state_tracks_pool_changes(self):
         self.algo.done()
         self.algo=PGDenseANN('euclidean', {})
