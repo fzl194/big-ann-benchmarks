@@ -2,7 +2,7 @@ name: Structural adapter arguments
 
 on:
   push:
-    branches: [codex/fzl194-optimization]
+    branches: [codex/fzl194-optimization, codex/pq-frontier-rerank, hackathon-dev]
   pull_request:
     branches: [hackathon-dev]
 
@@ -22,4 +22,5 @@ jobs:
           .ci-venv/bin/python -m pip install numpy scipy h5py 'psycopg[binary]' psutil PyYAML
       - run: |
           .ci-venv/bin/python -m unittest discover -s tests -p test_neighbor_code_budget.py -v
+          .ci-venv/bin/python -m unittest discover -s tests -p test_pq_frontier_rerank.py -v
           .ci-venv/bin/python -m unittest discover -s tests -p test_gsvector_writer_reconnect.py -v
