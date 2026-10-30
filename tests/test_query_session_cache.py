@@ -150,6 +150,27 @@ class SessionCacheTests(unittest.TestCase):
         self.adapter._query_chunk(self.q, 3)
         self.assertTrue(any('EXPLAIN (FORMAT JSON)' in str(c.args[0]) for c in replacement.execute.call_args_list))
 
+    @patch('neurips23.streaming.gsvector.module.has_index_plan', return_value=True)
+    def test_closed_connection_is_replaced_and_cache_is_not_reused(self, plan):
+        self.configure()
+        self.adapter._query_chunk(self.q, 3)
+        self.conn.closed = True
+        replacement = self.connection()
+        with patch('neurips23.streaming.gsvector.module.psycopg.connect', return_value=replacement) as connect:
+            self.adapter._query_chunk(self.q, 3)
+        connect.assert_called_once()
+        self.assertNotIn(self.conn, self.adapter._query_connections)
+        self.assertIn(replacement, self.adapter._query_connections)
+        self.assertTrue(any('EXPLAIN (FORMAT JSON)' in str(c.args[0]) for c in replacement.execute.call_args_list))
+
+    @patch('neurips23.streaming.gsvector.module.has_index_plan', return_value=False)
+    def test_failed_plan_is_never_cached(self, plan):
+        self.configure()
+        with self.assertRaisesRegex(RuntimeError, 'ANN index plan required'):
+            self.adapter._query_chunk(self.q, 3)
+        self.assertIsNone(self.adapter._query_local.session_state)
+        self.conn.close.assert_called_once()
+
 
 @unittest.skipUnless(os.environ.get('GSVECTOR_PG_DSN'), 'requires an isolated PostgreSQL test cluster')
 class SessionCachePostgresTests(unittest.TestCase):
