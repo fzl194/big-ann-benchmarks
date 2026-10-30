@@ -580,7 +580,7 @@ class Gsvector(BaseStreamingANN):
         args = dict(query_args)
         if set(args) - {"search_l", "threads", "random_io", "reuse_connections", "fed_run_pool_max",
                        "grouped_rerank", "federate_k", "query_order", "query_dispatch",
-                       "query_batch_size", "max_k", "pq_rerank_frontier", "refine_sq8", "refine_expanded_pool"}:
+                       "query_batch_size", "max_k", "pq_rerank_frontier", "refine_sq8", "refine_expanded_pool", "refine_u8_simd"}:
             raise ValueError(f"unknown query arguments: {args}")
         if args.get("query_order", "input") not in ("input", "locality"):
             raise ValueError("query_order must be input or locality")
@@ -597,7 +597,7 @@ class Gsvector(BaseStreamingANN):
                 raise ValueError("refine_expanded_pool must be an integer in 0..32768")
             if p and not args.get("refine_sq8", False):
                 raise ValueError("refine_expanded_pool requires refine_sq8")
-        for name in ("random_io", "reuse_connections", "grouped_rerank", "pq_rerank_frontier", "refine_sq8"):
+        for name in ("random_io", "reuse_connections", "grouped_rerank", "pq_rerank_frontier", "refine_sq8", "refine_u8_simd"):
             if name in args and not isinstance(args[name], bool):
                 raise ValueError(f"{name} must be boolean")
         if args.get("refine_sq8", False) and args.get("pq_rerank_frontier", False):
@@ -619,7 +619,7 @@ class Gsvector(BaseStreamingANN):
               args.get("reuse_connections", False) != self.query_args.get("reuse_connections", False)):
             self._close_query_pool()
         self.query_args = {"search_l": search_l, "threads": threads}
-        for name in ("random_io", "reuse_connections", "grouped_rerank", "pq_rerank_frontier", "refine_sq8"):
+        for name in ("random_io", "reuse_connections", "grouped_rerank", "pq_rerank_frontier", "refine_sq8", "refine_u8_simd"):
             if name in args:
                 self.query_args[name] = args[name]
         if "fed_run_pool_max" in args:
@@ -668,6 +668,24 @@ class Gsvector(BaseStreamingANN):
         if conn is self.conn:
             self._single_refine_sq8_overridden = explicit
 
+    def _apply_refine_u8_simd(self, conn):
+        explicit = "refine_u8_simd" in self.query_args
+        reset = ((conn is self.conn and getattr(self, "_single_refine_u8_simd_overridden", False)) or
+                 (conn is not self.conn and self.query_args.get("reuse_connections", False)))
+        if not explicit and not reset:
+            return
+        setting = conn.execute("SELECT vartype FROM pg_settings WHERE name = %s",
+                               ("gsvector.refine_u8_simd",)).fetchone()
+        if setting is None or setting[0] != "bool":
+            if explicit:
+                raise RuntimeError("refine_u8_simd requires a matching gsvector extension")
+            return
+        enabled = explicit and self.query_args["refine_u8_simd"]
+        conn.execute("SELECT set_config('gsvector.refine_u8_simd',%s,false)",
+                     ("on" if enabled else "off",))
+        if conn is self.conn:
+            self._single_refine_u8_simd_overridden = explicit
+
     def _apply_refine_expanded_pool(self, conn):
         explicit = "refine_expanded_pool" in self.query_args
         reset = ((conn is self.conn and getattr(self, "_single_expanded_pool_overridden", False)) or
@@ -688,6 +706,7 @@ class Gsvector(BaseStreamingANN):
     def _apply_random_io(self, conn):
         self._apply_pq_rerank_frontier(conn)
         self._apply_refine_sq8(conn)
+        self._apply_refine_u8_simd(conn)
         self._apply_refine_expanded_pool(conn)
         # Omitted option inherits the connection default (including PGOPTIONS).
         # Persistent single-query sessions must undo a previous explicit value.
