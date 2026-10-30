@@ -217,7 +217,11 @@ class StaticIntegrationTests(unittest.TestCase):
     def test_filtered_optional_build_strategy_and_layout(self):
         self._check_adaptive_filtered_ann({"build_beam_first":True,"build_neighbor_codes":False})
 
-    def _check_adaptive_filtered_ann(self,build_options):
+    def test_bounded_filtered_id_reuse_and_single_search(self):
+        self._check_adaptive_filtered_ann({"pq_m":4,"build_neighbor_code_bytes":64,
+                                          "prepare_refine":True},bounded=True)
+
+    def _check_adaptive_filtered_ann(self,build_options,bounded=False):
         base=np.zeros((96,32),dtype=np.float32)
         base[:,0]=np.arange(96)
         queries=base[[0,7,0,0]]
@@ -240,13 +244,19 @@ class StaticIntegrationTests(unittest.TestCase):
         try:
             adapter.fit(name)
             for option,value in build_options.items():
+                if option in ("pq_m","prepare_refine"):
+                    continue
                 self.assertEqual(adapter.conn.execute("SHOW gsvector."+option).fetchone()[0],
-                                 "on" if value else "off")
+                                 ("on" if value else "off") if type(value) is bool else str(value))
             schema=adapter.schema
             snapshots=[]
             for ceiling in (96,8):
-                adapter.set_query_arguments({"threads":2,"search_l":16,"initial_candidates":8,
-                                             "max_candidates":ceiling,"exact_cutoff":0})
+                args={"threads":2,"search_l":16,"initial_candidates":8,
+                      "max_candidates":ceiling,"exact_cutoff":0}
+                if bounded:
+                    args.update(filter_strategy="bounded",ann_candidates=ceiling,
+                                exact_cutoff=8,refine_sq8=True)
+                adapter.set_query_arguments(args)
                 adapter.filtered_query(queries,ds.get_queries_metadata(),5)
                 found=adapter.get_results()
                 np.testing.assert_array_equal(found[0],[80,82,84,86,88])
@@ -256,7 +266,13 @@ class StaticIntegrationTests(unittest.TestCase):
                 self.assertTrue(adapter.stats["ann_plan_verified"])
                 self.assertGreater(adapter.stats["ann_queries"],0)
                 self.assertEqual(adapter.schema,schema)
-                if ceiling==8:
+                if bounded:
+                    self.assertEqual(adapter.stats["reused_eligible_ids"],8)
+                    self.assertEqual(adapter.stats["effective_exact_cutoff"],8)
+                    self.assertEqual(adapter.stats["ann_attempts"],2)
+                    self.assertEqual(adapter.stats["small_exact_queries"],2)
+                    self.assertEqual(adapter.stats["fallback_exact_queries"],1 if ceiling==8 else 0)
+                elif ceiling==8:
                     self.assertGreaterEqual(adapter.stats["fallback_exact_queries"],2)
                 else:
                     self.assertGreater(adapter.stats["ann_attempts"],adapter.stats["ann_queries"])
@@ -265,8 +281,40 @@ class StaticIntegrationTests(unittest.TestCase):
                 self.assertEqual(hashlib.sha256(Path(item["pg_events_file"]).read_bytes()).hexdigest(),
                                  item["pg_events_sha256"])
                 self.assertTrue(item["native_ann"])
+            if bounded:
+                self._check_filter_snapshot(adapter,queries[:1],ds.get_queries_metadata()[:1])
         finally:
             adapter.done()
+
+    def _check_filter_snapshot(self,adapter,query,labels):
+        adapter.set_query_arguments({"threads":1,"filter_strategy":"bounded",
+                                     "ann_candidates":96,"exact_cutoff":8})
+        original_connect=adapter._connect
+        owner=adapter
+        class ProbeUpdateConnection:
+            def __init__(self):
+                self.conn=original_connect()
+                self.changed=False
+            def __enter__(self):
+                self.conn.__enter__()
+                return self
+            def __exit__(self,*args):
+                return self.conn.__exit__(*args)
+            def transaction(self):
+                return self.conn.transaction()
+            def execute(self,statement,params=None):
+                result=self.conn.execute(statement,params)
+                if statement.startswith("SELECT id FROM base WHERE tags") and "ORDER BY" not in statement:
+                    if not self.changed:
+                        owner.conn.execute("UPDATE base SET tags='{}'::integer[] WHERE id=80")
+                        self.changed=True
+                return result
+        with patch.object(adapter,"_connect",side_effect=ProbeUpdateConnection):
+            adapter.filtered_query(query,labels,5)
+        # A committed label change after probing must not change this query's
+        # repeatable-read snapshot between eligible IDs and exact scoring.
+        np.testing.assert_array_equal(adapter.get_results()[0],[80,82,84,86,88])
+        self.assertEqual(adapter.conn.execute("SELECT tags FROM base WHERE id=80").fetchone()[0],[])
 
     def test_sparse_high_terms_and_zero_score_fill(self):
         base = csr_matrix(([2,4,5,1,1], ([0,0,1,2,2], [1,30008,2,1,2])),

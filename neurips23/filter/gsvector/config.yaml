@@ -43,3 +43,19 @@ any:
         args: '[{"R": 32, "L": 100, "build_threads": 32, "batch_rows": 4096}]'
         query-args: '[{"threads": 32, "search_l": 200, "initial_candidates": 256, "max_candidates":
           8192, "exact_cutoff": 2048}]'
+  gsvector-filter-bounded:
+    docker-tag: vector-competition/gsvector-benchmark:release-20261026
+    module: benchmark.algorithms.pg_filtered
+    constructor: PGFilteredANN
+    base-args: ['@metric']
+    run-groups:
+      single-attempt-refine-ab:
+        # Requires rebuilding the matching image/extension; the old release
+        # image does not contain these options. Same R/L/precision as adaptive.
+        args: |
+          [{"R":32,"L":100,"build_threads":8,"batch_rows":4096,"build_neighbor_code_bytes":256,"prepare_refine":true}]
+        query-args: |
+          [{"threads":8,"search_l":200,"filter_strategy":"bounded","ann_candidates":1024,"max_candidates":8192,"exact_cutoff":2048,"refine_sq8":false},
+           {"threads":8,"search_l":200,"filter_strategy":"bounded","ann_candidates":1024,"max_candidates":8192,"exact_cutoff":2048,"refine_sq8":true},
+           {"threads":8,"search_l":200,"filter_strategy":"bounded","ann_candidates":4096,"max_candidates":8192,"exact_cutoff":2048,"refine_sq8":false},
+           {"threads":8,"search_l":200,"filter_strategy":"bounded","ann_candidates":4096,"max_candidates":8192,"exact_cutoff":2048,"refine_sq8":true}]
