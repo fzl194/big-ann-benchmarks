@@ -132,7 +132,8 @@ class PGDenseANN(Gsvector):
             state = (self.schema,self.query_args["search_l"],k,self.query_args.get("random_io"),
                      self.query_args.get("fed_run_pool_max"), self.query_args.get("grouped_rerank"),
                      self.query_args.get("federate_k"), self.query_args.get("max_k"),
-                     self.query_args.get("pq_rerank_frontier"), self.query_args.get("refine_sq8"))
+                     self.query_args.get("pq_rerank_frontier"), self.query_args.get("refine_sq8"),
+                     self.query_args.get("refine_expanded_pool"))
             if getattr(self,"_single_state",None) != state:
                 class VectorDumper(Dumper):
                     oid = self.vector_oid
