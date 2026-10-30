@@ -9,7 +9,7 @@ import numpy as np
 from scipy.sparse import csr_matrix
 
 from benchmark.algorithms.pg_exact import PGFilterExact, PGSparseExact
-from benchmark.algorithms.pg_dense import PGDenseANN
+from benchmark.algorithms.pg_dense import PGDenseANN, PGArrayANN
 from benchmark.algorithms.pg_filtered import PGFilteredANN
 from benchmark.dataset_io import write_sparse_matrix
 from benchmark.datasets import DATASETS
@@ -127,6 +127,25 @@ class StaticIntegrationTests(unittest.TestCase):
                 np.testing.assert_array_equal(adapter.get_results()[:, 0], [95, 0])
                 self.assertEqual(adapter.schema, schema)
                 self.assertEqual(adapter.conn.execute("SELECT count(*) FROM base").fetchone()[0], 96)
+        finally:
+            adapter.done()
+
+    def test_array_cosine_prepares_refine_before_query(self):
+        base=np.random.default_rng(271).normal(size=(96,32)).astype("float32")
+        adapter=PGArrayANN("normalized",16,64,2,4,64,True)
+        adapter.min_run_rows=0  # Small fixture must exercise a real PQ graph.
+        try:
+            adapter.fit(base)
+            self.assertGreaterEqual(adapter.refine_preparation["runs"],1)
+            self.assertIn("prepare_refine_s",adapter.build_times)
+            query=base[7]*3  # Cosine must preserve direction, not raw magnitude.
+            expected=np.argsort(1-base.astype("float64").dot(query)/
+                               (np.linalg.norm(base,axis=1)*np.linalg.norm(query)))[:10]
+            for enabled in (False,True):
+                adapter.set_query_arguments({"search_l":128,"threads":1,"max_k":96,
+                                             "federate_k":1.0,"refine_sq8":enabled})
+                found=adapter.query(query,10)
+                np.testing.assert_array_equal(found,expected)
         finally:
             adapter.done()
 

@@ -216,7 +216,12 @@ class PGDenseANN(Gsvector):
 class PGArrayANN(PGDenseANN):
     """Positional constructor convenient for ann-benchmarks/VIBE YAML sweeps."""
     def __init__(self, metric, R=32, L=100, build_threads=4, pq_m=0,
-                 build_neighbor_code_bytes=None):
+                 build_neighbor_code_bytes=None, prepare_refine=False):
+        if type(prepare_refine) is not bool:
+            raise ValueError("prepare_refine must be boolean")
+        if prepare_refine and canonical_metric(metric) not in ("euclidean","cosine"):
+            raise ValueError("prepare_refine requires L2 or cosine")
+        self.prepare_refine=prepare_refine
         if type(pq_m) is not int or not 0 <= pq_m <= 65528:
             raise ValueError("pq_m must be an integer in 0..65528")
         parameters = {"R": int(R), "L": int(L), "build_threads": int(build_threads)}
@@ -225,3 +230,21 @@ class PGArrayANN(PGDenseANN):
         if build_neighbor_code_bytes is not None:
             parameters["build_neighbor_code_bytes"] = build_neighbor_code_bytes
         super().__init__(metric, parameters)
+
+    def fit(self,dataset):
+        super().fit(dataset)
+        if not self.prepare_refine:
+            return
+        started=time.perf_counter()
+        function=sql.Identifier(self.schema,"_bench_prepare_refine")
+        self.conn.execute(sql.SQL(
+            "CREATE FUNCTION {}(regclass) RETURNS jsonb "
+            "AS '$libdir/gsvector','gsvector_prepare_refine' LANGUAGE C STRICT"
+        ).format(function))
+        index=sql.Identifier(self.schema,"ann_idx").as_string(None)
+        self.refine_preparation=self.conn.execute(
+            sql.SQL("SELECT {}(%s::regclass)").format(function),(index,)).fetchone()[0]
+        elapsed=time.perf_counter()-started
+        self.build_times={**self.build_times,"prepare_refine_s":elapsed}
+        self._record("prepare_refine",metric=self.metric,elapsed_s=elapsed,
+                     preparation=self.refine_preparation)
