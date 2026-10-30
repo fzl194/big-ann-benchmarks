@@ -1,0 +1,25 @@
+name: Structural adapter arguments
+
+on:
+  push:
+    branches: [codex/fzl194-optimization]
+  pull_request:
+    branches: [hackathon-dev]
+
+permissions:
+  contents: read
+
+jobs:
+  arguments:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - run: |
+          python3 -m venv .ci-venv
+          .ci-venv/bin/python -m pip install numpy scipy h5py 'psycopg[binary]' psutil PyYAML
+      - run: |
+          .ci-venv/bin/python -m unittest discover -s tests -p test_neighbor_code_budget.py -v
+          .ci-venv/bin/python -m unittest discover -s tests -p test_gsvector_writer_reconnect.py -v

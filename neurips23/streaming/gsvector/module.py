@@ -283,6 +283,11 @@ class Gsvector(BaseStreamingANN):
             conn.execute("SELECT set_config('gsvector.build_neighbor_codes',%s,false)",
                               ("on" if self.build_neighbor_codes else "off",))
         if "build_neighbor_code_bytes" in self.params:
+            registered = conn.execute("SELECT 1 FROM pg_settings WHERE name = %s",
+                                      ("gsvector.build_neighbor_code_bytes",)).fetchone()
+            if registered is None:
+                raise RuntimeError("a matching structural-optimization extension is required "
+                                   "for build_neighbor_code_bytes")
             conn.execute("SELECT set_config('gsvector.build_neighbor_code_bytes',%s,false)",
                               (str(self.build_neighbor_code_bytes),))
 

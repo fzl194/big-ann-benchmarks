@@ -88,6 +88,18 @@ class NeighborCodeBudgetTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaisesRegex(ValueError, "pq_m"):
                 PGArrayANN("normalized", 32, 100, 4, value, 2048)
 
+    def test_explicit_budget_rejects_an_old_server_before_build(self):
+        adapter = Gsvector("euclidean", {"build_neighbor_code_bytes": 2048})
+        try:
+            connection = MagicMock()
+            connection.execute.return_value.fetchone.return_value = None
+            with self.assertRaisesRegex(RuntimeError, "matching.*extension"):
+                adapter._configure_write_connection(connection, set_search_path=False)
+            self.assertFalse(any("set_config('gsvector.build_neighbor_code_bytes'" in str(call)
+                                 for call in connection.execute.call_args_list))
+        finally:
+            adapter.done()
+
 
 if __name__ == "__main__":
     unittest.main()
