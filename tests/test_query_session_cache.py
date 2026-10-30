@@ -168,8 +168,12 @@ class SessionCachePostgresTests(unittest.TestCase):
             try:
                 adapter.setup('float32', len(vectors), 32)
                 adapter.insert(vectors, np.arange(len(vectors)))
+                adapter.conn.execute("CREATE FUNCTION public.session_cache_prepare(regclass) RETURNS jsonb "
+                                     "AS '$libdir/gsvector','gsvector_prepare_refine' LANGUAGE C STRICT")
+                adapter.conn.execute('SELECT public.session_cache_prepare(%s::regclass)',
+                                     (f'{adapter.schema}.ann_idx',))
                 args = {'search_l': 100, 'threads': 1, 'reuse_connections': True,
-                        'cache_session_setup': True}
+                        'cache_session_setup': True, 'refine_sq8': True}
                 adapter._set_query_arguments(args, reset_workload=False)
                 adapter.query(vectors[:8], 10)
                 reference = adapter.get_results().copy()
