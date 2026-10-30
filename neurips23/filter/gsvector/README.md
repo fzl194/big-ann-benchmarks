@@ -37,6 +37,18 @@ requires that preparation, so query timing cannot silently build sidecars.
 It enables the existing L2 graph refinement and budgeted PostgreSQL shared
 cache. Both off/on arms in the example prepare the same sidecars.
 
+The example also enables build option `isolate_refine_cache=true`, exclusively
+for the dedicated benchmark PostgreSQL instance. During `fit`, private wrappers
+capture the original requested cache cap. During `set_query_arguments` (before
+the framework query timer), off requests zero and waits up to ten seconds for
+allocated, retired, and pending bytes to reach zero; on restores that original
+cap. A failed release aborts the point. This does not change automatic budgeting
+or force pages to become resident. Cleanup restores the original requested cap.
+No resize, reclamation wait, or code preparation occurs in `filtered_query`.
+Repetitions retain the framework's existing warm-through behavior; they are not
+cold-cache trials. The feature changes a cluster-wide setting, so never use it
+against a shared production database. It defaults to false for legacy callers.
+
 `gsvector-filter-bounded` supplies explicit 1024/4096 candidate experiments and
 refinement off/on variants. Rebuild the matching benchmark image first; its
 inherited release tag is not evidence an old downloaded image supports these

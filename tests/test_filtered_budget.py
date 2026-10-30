@@ -61,6 +61,45 @@ class FilterBudgetTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError,"prepare_refine"):
             self.adapter.filtered_query(None,None,10)
 
+    def cache_state(self,**changes):
+        return {"available":True,"requested_bytes":0,"allocated_bytes":0,
+                "retired_bytes":0,"pending_bytes":0,**changes}
+
+    def configure_isolated_cache(self,states):
+        self.adapter.isolate_refine_cache=True
+        self.adapter.cache_restore_bytes=64*1024**2
+        self.adapter._cache_stats=MagicMock(side_effect=states)
+        self.adapter._cache_resize=MagicMock()
+        self.adapter._record=MagicMock()
+
+    def test_off_releases_cache_before_query_timing_and_on_restores_requested_cap(self):
+        self.configure_isolated_cache([self.cache_state(),self.cache_state(requested_bytes=64*1024**2)])
+        self.configure(refine_sq8=False)
+        self.adapter._cache_resize.assert_called_once_with(0)
+        self.configure(refine_sq8=True)
+        self.assertEqual(self.adapter._cache_resize.call_args.args,(64*1024**2,))
+
+    def test_off_waits_for_retired_and_pending_bytes_not_only_allocated(self):
+        self.configure_isolated_cache([self.cache_state(retired_bytes=4096),
+                                       self.cache_state(pending_bytes=4096),self.cache_state()])
+        with patch("benchmark.algorithms.pg_filtered.time.sleep") as sleep:
+            self.configure(refine_sq8=False)
+        self.assertEqual(sleep.call_count,2)
+
+    def test_cache_release_timeout_and_unavailable_cache_fail_explicitly(self):
+        self.configure_isolated_cache([self.cache_state(allocated_bytes=4096)])
+        with patch("benchmark.algorithms.pg_filtered.time.monotonic",side_effect=[0,11]):
+            with self.assertRaisesRegex(RuntimeError,"resident"):
+                self.configure(refine_sq8=False)
+        self.configure_isolated_cache([self.cache_state(available=False)])
+        with self.assertRaisesRegex(RuntimeError,"unavailable"):
+            self.configure(refine_sq8=False)
+
+    def test_cache_isolation_is_opt_in_and_boolean(self):
+        self.assertFalse(self.adapter.isolate_refine_cache)
+        with self.assertRaisesRegex(ValueError,"isolate_refine_cache"):
+            PGFilteredANN("euclidean",{"isolate_refine_cache":"on"})
+
     def test_build_applies_integer_options_and_prepares_codes_before_queries(self):
         algo=PGFilteredANN("euclidean",{"pq_m":24,"build_neighbor_code_bytes":0,
                                          "build_raw_cache_mb":128,"build_gather_threads":4,

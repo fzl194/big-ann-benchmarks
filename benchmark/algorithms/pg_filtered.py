@@ -26,7 +26,8 @@ class PGFilteredANN(PGFilterExact):
         params=dict(index_params)
         allowed={"batch_rows","R","L","alpha","build_threads","min_run_rows",
                  "build_beam_first","build_neighbor_codes","build_neighbor_code_bytes",
-                 "build_raw_cache_mb","build_gather_threads","pq_m","prepare_refine"}
+                 "build_raw_cache_mb","build_gather_threads","pq_m","prepare_refine",
+                 "isolate_refine_cache"}
         if set(params)-allowed:
             raise ValueError("unsupported filtered ANN build parameters")
         super().__init__(metric,{"batch_rows":params.get("batch_rows",4096)})
@@ -54,6 +55,10 @@ class PGFilteredANN(PGFilterExact):
         self.prepare_refine=params.get("prepare_refine",False)
         if type(self.prepare_refine) is not bool:
             raise ValueError("prepare_refine must be boolean")
+        self.isolate_refine_cache=params.get("isolate_refine_cache",False)
+        if type(self.isolate_refine_cache) is not bool:
+            raise ValueError("isolate_refine_cache must be boolean")
+        self.cache_restore_bytes=None
         self.refine_prepared=False
         if (not 1<=self.R<=self.L<=4096 or not 1<=self.alpha<=4 or
                 self.build_threads<1 or self.min_run_rows<0):
@@ -97,8 +102,11 @@ class PGFilteredANN(PGFilterExact):
                 "SELECT prepare_refine('ann_idx'::regclass)").fetchone()[0]
             self.refine_prepared=True
             self.build_times["prepare_refine_s"]=time.perf_counter()-prepared_at
+        if self.isolate_refine_cache:
+            self._setup_cache_isolation()
         self._record("ann_fit",rows=self.nb,parameters={"R":self.R,"L":self.L,"alpha":self.alpha,
                                                      "pq_m":self.pq_m,"prepare_refine":self.prepare_refine,
+                                                     "isolate_refine_cache":self.isolate_refine_cache,
                                                      **self.build_options},
                      build_times=self.build_times)
 
@@ -125,6 +133,57 @@ class PGFilteredANN(PGFilterExact):
         if (self.threads<1 or not 1<=self.search_l<=32768 or self.exact_cutoff<0 or
                 not 1<=self.initial_candidates<=self.max_candidates<=32768):
             raise ValueError("invalid filtered ANN query parameters")
+        # Benchmark runners set query arguments before starting query timing.
+        # Never resize or wait for reclamation inside filtered_query itself.
+        if self.isolate_refine_cache and self.cache_restore_bytes is not None:
+            self._isolate_query_cache()
+
+    def _setup_cache_isolation(self):
+        for name,args,result,symbol in (
+                ("_bench_refine_cache_stats","","jsonb","gsvector_refine_cache_stats"),
+                ("_bench_refine_cache_resize","bigint","boolean","gsvector_refine_cache_resize")):
+            self.conn.execute(sql.SQL(
+                "CREATE FUNCTION {}({}) RETURNS {} AS '$libdir/gsvector',{} LANGUAGE C STRICT"
+            ).format(sql.Identifier(self.schema,name),sql.SQL(args),sql.SQL(result),sql.Literal(symbol)))
+        initial=self._cache_stats()
+        if not initial.get("available"):
+            raise RuntimeError("shared refinement cache unavailable for isolated benchmark")
+        self.cache_restore_bytes=initial["requested_bytes"]
+        self._isolate_query_cache()
+
+    def _cache_stats(self):
+        return self.conn.execute(sql.SQL("SELECT {}()").format(
+            sql.Identifier(self.schema,"_bench_refine_cache_stats"))).fetchone()[0]
+
+    def _cache_resize(self,amount):
+        return self.conn.execute(sql.SQL("SELECT {}(%s)").format(
+            sql.Identifier(self.schema,"_bench_refine_cache_resize")),(amount,)).fetchone()[0]
+
+    def _isolate_query_cache(self):
+        target=self.cache_restore_bytes if self.refine_sq8 else 0
+        self._cache_resize(target)
+        deadline=time.monotonic()+10
+        while True:
+            current=self._cache_stats()
+            if not current.get("available"):
+                raise RuntimeError("shared refinement cache unavailable during isolation")
+            if current["requested_bytes"]!=target:
+                raise RuntimeError("shared refinement cache request changed during isolation")
+            if target or not any(current[key] for key in
+                                 ("allocated_bytes","retired_bytes","pending_bytes")):
+                break
+            if time.monotonic()>=deadline:
+                raise RuntimeError("off point would inherit resident refinement cache")
+            time.sleep(0.02)
+        self._record("refine_cache_isolation",enabled=self.refine_sq8,cache=current)
+
+    def done(self):
+        try:
+            if self.cache_restore_bytes is not None and self.conn is not None:
+                self._cache_resize(self.cache_restore_bytes)
+                self.cache_restore_bytes=None
+        finally:
+            super().done()
 
     @staticmethod
     def _new_filter_stats():

@@ -238,7 +238,7 @@ class StaticIntegrationTests(unittest.TestCase):
 
     def test_bounded_filtered_id_reuse_and_single_search(self):
         self._check_adaptive_filtered_ann({"pq_m":4,"build_neighbor_code_bytes":64,
-                                          "prepare_refine":True},bounded=True)
+                                          "prepare_refine":True,"isolate_refine_cache":True},bounded=True)
 
     def _check_adaptive_filtered_ann(self,build_options,bounded=False):
         base=np.zeros((96,32),dtype=np.float32)
@@ -263,12 +263,16 @@ class StaticIntegrationTests(unittest.TestCase):
         try:
             adapter.fit(name)
             for option,value in build_options.items():
-                if option in ("pq_m","prepare_refine"):
+                if option in ("pq_m","prepare_refine","isolate_refine_cache"):
                     continue
                 self.assertEqual(adapter.conn.execute("SHOW gsvector."+option).fetchone()[0],
                                  ("on" if value else "off") if type(value) is bool else str(value))
             schema=adapter.schema
             snapshots=[]
+            if bounded:
+                cache=adapter._cache_stats()
+                self.assertEqual(cache["requested_bytes"],0)
+                self.assertEqual(cache["allocated_bytes"],0)
             for ceiling in (96,8):
                 args={"threads":2,"search_l":16,"initial_candidates":8,
                       "max_candidates":ceiling,"exact_cutoff":0}
@@ -276,7 +280,10 @@ class StaticIntegrationTests(unittest.TestCase):
                     args.update(filter_strategy="bounded",ann_candidates=ceiling,
                                 exact_cutoff=8,refine_sq8=True)
                 adapter.set_query_arguments(args)
-                adapter.filtered_query(queries,ds.get_queries_metadata(),5)
+                if bounded:
+                    self.assertEqual(adapter._cache_stats()["requested_bytes"],adapter.cache_restore_bytes)
+                with patch.object(adapter,"_cache_resize",side_effect=AssertionError("cache resize inside timing")):
+                    adapter.filtered_query(queries,ds.get_queries_metadata(),5)
                 found=adapter.get_results()
                 np.testing.assert_array_equal(found[0],[80,82,84,86,88])
                 self.assertEqual(found[1,0],7)
@@ -286,6 +293,7 @@ class StaticIntegrationTests(unittest.TestCase):
                 self.assertGreater(adapter.stats["ann_queries"],0)
                 self.assertEqual(adapter.schema,schema)
                 if bounded:
+                    self.assertGreater(adapter._cache_stats()["allocated_bytes"],0)
                     self.assertEqual(adapter.stats["reused_eligible_ids"],8)
                     self.assertEqual(adapter.stats["effective_exact_cutoff"],8)
                     self.assertEqual(adapter.stats["ann_attempts"],2)
@@ -308,6 +316,9 @@ class StaticIntegrationTests(unittest.TestCase):
     def _check_filter_snapshot(self,adapter,query,labels):
         adapter.set_query_arguments({"threads":1,"filter_strategy":"bounded",
                                      "ann_candidates":96,"exact_cutoff":8})
+        off=adapter._cache_stats()
+        for key in ("requested_bytes","allocated_bytes","retired_bytes","pending_bytes"):
+            self.assertEqual(off[key],0)
         original_connect=adapter._connect
         owner=adapter
         class ProbeUpdateConnection:
