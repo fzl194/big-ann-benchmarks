@@ -214,5 +214,13 @@ class PGDenseANN(Gsvector):
 
 class PGArrayANN(PGDenseANN):
     """Positional constructor convenient for ann-benchmarks/VIBE YAML sweeps."""
-    def __init__(self, metric, R=32, L=100, build_threads=4):
-        super().__init__(metric, {"R": int(R), "L": int(L), "build_threads": int(build_threads)})
+    def __init__(self, metric, R=32, L=100, build_threads=4, pq_m=0,
+                 build_neighbor_code_bytes=None):
+        if type(pq_m) is not int or not 0 <= pq_m <= 65528:
+            raise ValueError("pq_m must be an integer in 0..65528")
+        parameters = {"R": int(R), "L": int(L), "build_threads": int(build_threads)}
+        if pq_m != 0:
+            parameters["pq_m"] = pq_m
+        if build_neighbor_code_bytes is not None:
+            parameters["build_neighbor_code_bytes"] = build_neighbor_code_bytes
+        super().__init__(metric, parameters)

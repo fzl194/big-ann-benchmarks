@@ -117,7 +117,7 @@ class Gsvector(BaseStreamingANN):
         self.params = dict(index_params)
         allowed = {"R", "L", "alpha", "build_threads", "batch_rows", "compact_runs",
                    "min_run_rows", "compaction", "compact_max_rows", "build_beam_first",
-                   "build_neighbor_codes", "pq_m", "reclaim_max_rows",
+                   "build_neighbor_codes", "build_neighbor_code_bytes", "pq_m", "reclaim_max_rows",
                    "reclaim_max_runs", "reclaim_cooldown", "reclaim_min_dead",
                    "reclaim_min_dead_fraction", "reclaim_backoff_max", "release_input_cache",
                    "vacuum_memtables", "trim_allocator", "reconnect_writer"}
@@ -148,6 +148,10 @@ class Gsvector(BaseStreamingANN):
         self.build_neighbor_codes = self.params.get("build_neighbor_codes", True)
         if not isinstance(self.build_neighbor_codes, bool):
             raise ValueError("build_neighbor_codes must be boolean")
+        self.build_neighbor_code_bytes = self.params.get("build_neighbor_code_bytes", -1)
+        if (type(self.build_neighbor_code_bytes) is not int or
+                not -1 <= self.build_neighbor_code_bytes <= 2147483647):
+            raise ValueError("build_neighbor_code_bytes must be an integer in -1..2147483647")
         self.batch_rows = int(self.params.get("batch_rows", 32768))
         self.compact_runs = int(self.params.get("compact_runs", 8))
         self.compact_max_rows = int(self.params.get("compact_max_rows", 0))
@@ -278,6 +282,9 @@ class Gsvector(BaseStreamingANN):
         if "build_neighbor_codes" in self.params:
             conn.execute("SELECT set_config('gsvector.build_neighbor_codes',%s,false)",
                               ("on" if self.build_neighbor_codes else "off",))
+        if "build_neighbor_code_bytes" in self.params:
+            conn.execute("SELECT set_config('gsvector.build_neighbor_code_bytes',%s,false)",
+                              (str(self.build_neighbor_code_bytes),))
 
     def _reconnect_writer(self):
         if not self.reconnect_writer:
