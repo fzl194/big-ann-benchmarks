@@ -157,6 +157,23 @@ Two additional **unvalidated full-run controls**, not new defaults:
 
 ## Measurement boundaries
 
+`cache_session_setup` is an optional query argument, default `false`; `true`
+requires `reuse_connections=true`. On an owned persistent worker connection,
+it reuses the vector adapter, session settings, and the result of a previous
+successful ANN `EXPLAIN` check only while its complete query configuration,
+schema, operator, vector type, k, backend and local maintenance generation match.
+It does **not** cache or pin the PostgreSQL execution plan: PostgreSQL still
+plans/executes ordinary `ORDER BY ... LIMIT` statements. An initial EXPLAIN
+does not prove later statements select the same plan if schema or statistics
+change. This mode requires exclusive ownership of worker sessions and a stable
+index and planner configuration during a measured run. After external DDL,
+ANALYZE, session changes, or any uncertain external state, call
+`adapter.invalidate_query_sessions()` before the next query; arbitrary changes
+by other clients cannot be detected without another database round trip. The
+adapter invalidates its own cache on index build/maintenance and drops failed
+cached sessions without retrying their queries. Each SQL statement keeps its
+normal autocommit snapshot; this option does not use batch SRF or pipeline.
+
 The official runner's `search_times` includes each full query batch, connection
 setup and diagnostic overhead. It is not pure graph-search latency.
 Streaming index construction belongs to the first insertion step, not setup.

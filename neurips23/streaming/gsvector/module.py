@@ -204,6 +204,8 @@ class Gsvector(BaseStreamingANN):
         self._query_local = threading.local()
         self._query_connections = []
         self._query_connections_lock = threading.Lock()
+        self._query_session_epoch = 0
+        self._query_session_cache_ever_enabled = False
         self.schema = None
         self.events = []
         self.maintenance_totals = {}
@@ -325,6 +327,23 @@ class Gsvector(BaseStreamingANN):
         self._query_connections.clear()
         self._query_local = threading.local()
 
+    def invalidate_query_sessions(self):
+        """Close owned readers after external DDL/session changes, before next query.
+
+        This cannot detect changes made by other database clients. Callers opting
+        into setup caching must own these connections and keep the schema stable.
+        """
+        self._query_session_epoch += 1
+        self._close_query_pool()
+        self._single_state = None
+
+    def _mark_query_sessions_stale(self):
+        # Even if the option is temporarily off, a previously cached reader
+        # may survive and must not be reused after a later re-enable.
+        self._query_session_epoch += 1
+        if self._query_session_cache_ever_enabled:
+            self._single_state = None
+
     @contextmanager
     def _query_connection(self):
         if not self.query_args.get("reuse_connections", False):
@@ -332,6 +351,14 @@ class Gsvector(BaseStreamingANN):
                 yield connection
             return
         connection = getattr(self._query_local, "connection", None)
+        if (connection is not None and self.query_args.get("cache_session_setup", False)
+                and (connection.closed or connection.broken)):
+            with self._query_connections_lock:
+                if connection in self._query_connections:
+                    self._query_connections.remove(connection)
+            self._query_local.connection = None
+            self._query_local.session_state = None
+            connection = None
         if connection is None:
             connection = psycopg.connect(self.dsn, autocommit=True)
             self._query_local.connection = connection
@@ -339,7 +366,17 @@ class Gsvector(BaseStreamingANN):
                 self._query_connections.append(connection)
         # Do not retry failed queries: that would hide correctness failures and
         # alter measured workload semantics.
-        yield connection
+        try:
+            yield connection
+        except BaseException:
+            if self.query_args.get("cache_session_setup", False):
+                self._query_local.session_state = None
+                self._query_local.connection = None
+                with self._query_connections_lock:
+                    if connection in self._query_connections:
+                        self._query_connections.remove(connection)
+                connection.close()
+            raise
 
     def _record(self, operation, **data):
         event = {"operation": operation, "live_rows": self.live_count, **data}
@@ -391,6 +428,7 @@ class Gsvector(BaseStreamingANN):
             self.maintenance_totals[key] = self.maintenance_totals.get(key, 0) + value
 
     def _build_index(self):
+        self._mark_query_sessions_stale()
         if self.pq_m and (self.dim <= 0 or self.dim % self.pq_m):
             raise ValueError("pq_m must divide the indexed dimension")
         # Keep the default SQL compatible with installations predating pq_m.
@@ -431,6 +469,7 @@ class Gsvector(BaseStreamingANN):
     def _maintenance(self):
         if not self.index_ready:
             return
+        self._mark_query_sessions_stale()
         # All calls autocommit: run-list publication occurs at transaction commit.
         # With gsvector.worker=off, parallel VACUUM deliberately skips inline
         # drain. Serialize maintenance before reusing the other memtable slot.
@@ -580,7 +619,7 @@ class Gsvector(BaseStreamingANN):
         args = dict(query_args)
         if set(args) - {"search_l", "threads", "random_io", "reuse_connections", "fed_run_pool_max",
                        "grouped_rerank", "federate_k", "query_order", "query_dispatch",
-                       "query_batch_size", "max_k", "pq_rerank_frontier", "refine_sq8"}:
+                       "query_batch_size", "max_k", "pq_rerank_frontier", "refine_sq8", "cache_session_setup"}:
             raise ValueError(f"unknown query arguments: {args}")
         if args.get("query_order", "input") not in ("input", "locality"):
             raise ValueError("query_order must be input or locality")
@@ -591,9 +630,13 @@ class Gsvector(BaseStreamingANN):
             raise ValueError("query_batch_size must be an integer in 1..32")
         if "max_k" in args and (type(args["max_k"]) is not int or not 1 <= args["max_k"] <= 32768):
             raise ValueError("max_k must be an integer in 1..32768")
-        for name in ("random_io", "reuse_connections", "grouped_rerank", "pq_rerank_frontier", "refine_sq8"):
+        for name in ("random_io", "reuse_connections", "grouped_rerank", "pq_rerank_frontier", "refine_sq8", "cache_session_setup"):
             if name in args and not isinstance(args[name], bool):
                 raise ValueError(f"{name} must be boolean")
+        if args.get("cache_session_setup", False) and not args.get("reuse_connections", False):
+            raise ValueError("cache_session_setup requires reuse_connections")
+        if args.get("cache_session_setup", False):
+            self._query_session_cache_ever_enabled = True
         if args.get("refine_sq8", False) and args.get("pq_rerank_frontier", False):
             raise ValueError("refine_sq8 and pq_rerank_frontier are mutually exclusive")
         search_l = int(args.get("search_l", 200))
@@ -613,7 +656,7 @@ class Gsvector(BaseStreamingANN):
               args.get("reuse_connections", False) != self.query_args.get("reuse_connections", False)):
             self._close_query_pool()
         self.query_args = {"search_l": search_l, "threads": threads}
-        for name in ("random_io", "reuse_connections", "grouped_rerank", "pq_rerank_frontier", "refine_sq8"):
+        for name in ("random_io", "reuse_connections", "grouped_rerank", "pq_rerank_frontier", "refine_sq8", "cache_session_setup"):
             if name in args:
                 self.query_args[name] = args[name]
         if "fed_run_pool_max" in args:
@@ -711,29 +754,25 @@ class Gsvector(BaseStreamingANN):
 
     def _query_chunk(self, queries, k):
         with self._query_connection() as conn:
-            class VectorDumper(Dumper):
-                oid = self.vector_oid
-                format = Format.BINARY
-
-                def dump(self, obj):
-                    return obj
-
-            conn.adapters.register_dumper(VectorBytes, VectorDumper)
-            conn.execute(sql.SQL("SET search_path TO {}, public").format(sql.Identifier(self.schema)))
-            conn.execute("SET enable_seqscan=off")
-            conn.execute("SET enable_bitmapscan=off")
-            conn.execute("SET max_parallel_workers_per_gather=0")
-            conn.execute("SET gsvector.query_beam_first=on")
-            conn.execute("SELECT set_config('gsvector.search_l',%s,false)",
-                         (str(self.query_args["search_l"]),))
-            conn.execute("SELECT set_config('gsvector.scan_target_k',%s,false)", (str(k),))
-            self._apply_random_io(conn)
             statement = f"SELECT id FROM base ORDER BY embedding {self.operator} %s LIMIT %s"
-            if len(queries):
-                plan = conn.execute("EXPLAIN (FORMAT JSON) " + statement,
-                                    (encode_vector(queries[0]), k)).fetchone()[0]
-                if not has_index_plan(plan):
-                    raise RuntimeError(f"ANN index plan required: {plan}")
+            cache_key = None
+            if self.query_args.get("cache_session_setup", False) and len(queries):
+                # Key contains every configuration value, actual connection and
+                # backend identity, and adapter-known DDL/maintenance epoch.
+                # Non-idle/non-autocommit sessions are conservatively reconfigured.
+                if (not conn.closed and not conn.broken and conn.autocommit and
+                        conn.info.transaction_status == TransactionStatus.IDLE):
+                    pid = conn.info.backend_pid
+                    if type(pid) is int and pid > 0:
+                        cache_key = (self.schema, self.operator, self.vector_oid, k, pid,
+                                     id(conn), threading.get_ident(), self._query_session_epoch,
+                                     json.dumps(self.query_args, sort_keys=True, separators=(',', ':')))
+            cached = cache_key is not None and getattr(self._query_local, "session_state", None) == cache_key
+            if not cached:
+                self._query_local.session_state = None
+                self._configure_query_session(conn, queries, k, statement)
+                if cache_key is not None:
+                    self._query_local.session_state = cache_key
             result = np.full((len(queries), k), -1, dtype=np.int32)
             expected = min(k, self.live_count)
             batch_size = self.query_args.get("query_batch_size", 1)
@@ -772,6 +811,30 @@ class Gsvector(BaseStreamingANN):
                     raise RuntimeError(f"ANN returned {len(values)} results, expected {expected}")
                 result[i, :len(values)] = values
             return result
+
+    def _configure_query_session(self, conn, queries, k, statement):
+        class VectorDumper(Dumper):
+            oid = self.vector_oid
+            format = Format.BINARY
+
+            def dump(self, obj):
+                return obj
+
+        conn.adapters.register_dumper(VectorBytes, VectorDumper)
+        conn.execute(sql.SQL("SET search_path TO {}, public").format(sql.Identifier(self.schema)))
+        conn.execute("SET enable_seqscan=off")
+        conn.execute("SET enable_bitmapscan=off")
+        conn.execute("SET max_parallel_workers_per_gather=0")
+        conn.execute("SET gsvector.query_beam_first=on")
+        conn.execute("SELECT set_config('gsvector.search_l',%s,false)",
+                     (str(self.query_args["search_l"]),))
+        conn.execute("SELECT set_config('gsvector.scan_target_k',%s,false)", (str(k),))
+        self._apply_random_io(conn)
+        if len(queries):
+            plan = conn.execute("EXPLAIN (FORMAT JSON) " + statement,
+                                (encode_vector(queries[0]), k)).fetchone()[0]
+            if not has_index_plan(plan):
+                raise RuntimeError(f"ANN index plan required: {plan}")
 
     def query(self, X, k):
         start = time.perf_counter()
